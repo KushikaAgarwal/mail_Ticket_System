@@ -1,0 +1,25 @@
+{
+  "name": "mail-management-backend",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "ingest:once": "node -e \"require('./mailIngest').runIngestOnce().then(r=>console.log(JSON.stringify(r,null,2)))\""
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
+    "axios": "^1.7.9",
+    "cheerio": "^1.2.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "email-reply-parser": "^2.3.9",
+    "express": "^4.21.2",
+    "html-to-text": "^10.0.0",
+    "imap-simple": "^5.1.0",
+    "mailparser": "^3.7.2",
+    "node-cron": "^3.0.3",
+    "nodemailer": "^9.0.4",
+    "pg": "^8.23.0"
+  }
+}

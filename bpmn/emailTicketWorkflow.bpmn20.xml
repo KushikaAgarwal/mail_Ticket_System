@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xmlns:flowable="http://flowable.org/bpmn"
+  targetNamespace="http://urcsupport.com/mail">
+
+  <!-- ─────────────────────────────────────────────────────────────
+       emailTicketWorkflow
+       One process instance = one support ticket, created by the Node
+       mail-ingestion service right after the hybrid NLP+Claude
+       extraction step. Variables are seeded at process start:
+
+         subject, description, senderEmail, customerName, customerEmail,
+         category, urgency, sentiment, receivedAt, ticketStatus
+
+       Design note: the review task is long-lived. The admin frontend
+       updates `ticketStatus` (OPEN -> IN_PROGRESS -> RESOLVED) and adds
+       comments via the comments API WITHOUT completing the task, so the
+       task stays assigned to the admin group throughout triage. The task
+       is only completed (action=complete) when the admin sets the final
+       CLOSED status, which is what actually advances the token to the
+       end event. This mirrors how TaskDetails/ObservationTask.tsx in the
+       audit app free-write process variables via saveProcessVariable and
+       only call completeTask on the terminal action.
+       ───────────────────────────────────────────────────────────── -->
+
+  <process id="emailTicketWorkflow" name="Email Ticket Workflow" isExecutable="true">
+
+    <startEvent id="startEvent" name="Mail Received"/>
+
+    <sequenceFlow sourceRef="startEvent" targetRef="reviewTicket"/>
+
+    <userTask id="reviewTicket" name="Review Ticket"
+              flowable:candidateGroups="admin"
+              flowable:formKey="reviewTicket"/>
+
+    <sequenceFlow sourceRef="reviewTicket" targetRef="gw_ticketOutcome"/>
+
+    <!-- Reached only when the admin completes the task (ticketStatus == CLOSED).
+         Gateway is kept even though there's currently one true path, so an
+         escalation branch (e.g. reopened -> back to reviewTicket) can be
+         added later without touching the rest of the process. -->
+    <exclusiveGateway id="gw_ticketOutcome" name="Closed?" default="flow_reopen"/>
+
+    <sequenceFlow id="flow_closed" sourceRef="gw_ticketOutcome" targetRef="endTicketClosed">
+      <conditionExpression xsi:type="tFormalExpression"><![CDATA[${ticketStatus == 'CLOSED'}]]></conditionExpression>
+    </sequenceFlow>
+
+    <sequenceFlow id="flow_reopen" sourceRef="gw_ticketOutcome" targetRef="reviewTicket"/>
+
+    <endEvent id="endTicketClosed" name="Ticket Closed"/>
+
+  </process>
+</definitions>
