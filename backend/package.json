@@ -20,6 +20,7 @@
     "mailparser": "^3.7.2",
     "node-cron": "^3.0.3",
     "nodemailer": "^9.0.4",
+    "p-limit": "^3.1.0",
     "pg": "^8.23.0"
   }
 }
