@@ -244,7 +244,7 @@ const { startTicketProcess } = require('./flowableClient');
 const { extractFromEmail } = require('./nlpExtract');
 const { sendAcknowledgementEmail } = require('./emailService');
 const { extractReplyText } = require('./replyExtract');
-
+const pLimit = require('p-limit');
 const imapConfig = {
   imap: {
     user: process.env.EMAIL,
@@ -426,15 +426,21 @@ async function runIngestOnce() {
   const fetchOptions = { bodies: [''], markSeen: false, struct: true };
   const messages = await connection.search(searchCriteria, fetchOptions);
 
-  const results = [];
-  for (const message of messages) {
-    try {
-      results.push(await processMessage(connection, message));
-    } catch (err) {
-      console.error('[mailIngest] processMessage failed:', err);
-      results.push({ error: err.message, uid: message.attributes.uid });
-    }
-  }
+  const CONCURRENCY = Number(process.env.INGEST_CONCURRENCY) || 8;
+  const limit = pLimit(CONCURRENCY);
+
+  const results = await Promise.all(
+    messages.map((message) =>
+      limit(async () => {
+        try {
+          return await processMessage(connection, message);
+        } catch (err) {
+          console.error('[mailIngest] processMessage failed:', err);
+          return { error: err.message, uid: message.attributes.uid };
+        }
+      })
+    )
+  );
 
   await connection.end();
   return results;

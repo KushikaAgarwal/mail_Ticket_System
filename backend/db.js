@@ -21,7 +21,7 @@ const pool = new Pool({
   database: process.env.DB_NAME || 'flowable',
   user: process.env.DB_USER || 'flowable',
   password: process.env.DB_PASS || 'flowable',
-  max: 10,                     // max simultaneous connections in the pool
+  max: 20,                     // max simultaneous connections in the pool
   idleTimeoutMillis: 30000,
 });
 
