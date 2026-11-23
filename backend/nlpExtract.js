@@ -5,12 +5,18 @@
  *   - strips quoted history ("On ... wrote:"), signatures, disclaimers
  *   - pulls a candidate customer name/email from headers
  *   - cheap keyword-based urgency pre-flag ("urgent", "down", "asap", "!!!")
+ *   - filters out obvious system/automated mail (bounces, delivery
+ *     failures, out-of-office, auto-replies) BEFORE calling Claude at
+ *     all, so no API cost is spent on mail that was never going to
+ *     become a ticket
  *
  * Layer 2 (Claude) — only runs on the CLEANED body, not the raw email, so
  * signatures/quoted threads/HTML cruft never burn tokens. Returns strict
- * JSON so it drops straight into Flowable process variables. We only escalate
- * ambiguous urgency/sentiment calls to Claude; the obvious ones from layer 1
- * are passed through as a hint the model can override if the text disagrees.
+ * JSON so it drops straight into Flowable process variables. Also makes
+ * the final call on whether this is actually a genuine customer
+ * query/complaint — anything that isn't (spam, newsletters, automated
+ * notifications the header/subject filter didn't catch) is flagged so
+ * mailIngest.js can skip ticket creation.
  *
  * Model choice: Claude Haiku 4.5 by default (fast/cheap, plenty for
  * structured field extraction on a single email). Long or ambiguous emails
@@ -28,7 +34,39 @@ const LONG_EMAIL_CHARS = 2000;
 
 const URGENT_KEYWORDS = ['urgent', 'asap', 'immediately', 'down', 'outage', 'critical', 'not working', 'blocked', 'production'];
 
-// ── Layer 1: cheap local cleanup ────────────────────────────────────────
+// ── Layer 1a: obvious system/automated mail — never even reaches Claude ─
+const SYSTEM_SENDER_PATTERNS = [
+  /mailer-daemon/i,
+  /postmaster/i,
+  /no-?reply/i,
+  /do-?not-?reply/i,
+  /bounce/i,
+  /mail-?delivery/i,
+];
+
+const SYSTEM_SUBJECT_PATTERNS = [
+  /delivery status notification/i,
+  /undeliver(ed|able)/i,
+  /returned mail/i,
+  /mail delivery failed/i,
+  /delivery has failed/i,
+  /automatic reply/i,
+  /auto-?reply/i,
+  /out of office/i,
+  /^re: \[.*\] support ticket created/i, // our own acknowledgement, if it ever loops back
+];
+
+/** Fast, free, catches the large majority of non-customer mail (bounces,
+ *  auto-replies) purely from headers — no API call needed. */
+function isObviousSystemMail({ fromHeader, subjectHeader }) {
+  const from = fromHeader || '';
+  const subject = subjectHeader || '';
+  if (SYSTEM_SENDER_PATTERNS.some((p) => p.test(from))) return true;
+  if (SYSTEM_SUBJECT_PATTERNS.some((p) => p.test(subject))) return true;
+  return false;
+}
+
+// ── Layer 1b: cheap local cleanup ────────────────────────────────────────
 function cleanBody(rawText) {
   let text = rawText || '';
 
@@ -67,9 +105,10 @@ function extractHeaderCustomer(fromHeader) {
 }
 
 // ── Layer 2: Claude structured extraction ───────────────────────────────
-const SYSTEM_PROMPT = `You extract structured support-ticket fields from a customer email body.
+const SYSTEM_PROMPT = `You extract structured support-ticket fields from a customer email body, and decide whether this email is actually a genuine customer support request.
 Return ONLY a JSON object, no prose, no markdown fences, matching exactly this shape:
 {
+  "isSupportRequest": boolean, // true ONLY if this is a genuine query, complaint, or request from a customer that needs a human support response. false for: automated notifications, bounce/delivery-failure messages, out-of-office or auto-reply messages, newsletters, marketing/spam, calendar invites, or any other non-human-authored or non-support content — even if it mentions the company or a ticket number.
   "subject": string,          // concise ticket title, <= 12 words, written by you (do not just copy the email subject verbatim if it's vague, e.g. "Re: Re: Hi")
   "description": string,      // 2-4 sentence neutral summary of the customer's issue/request, in your own words
   "customerName": string|null,
@@ -77,6 +116,7 @@ Return ONLY a JSON object, no prose, no markdown fences, matching exactly this s
   "urgency": "LOW"|"MEDIUM"|"HIGH",
   "sentiment": "POSITIVE"|"NEUTRAL"|"NEGATIVE"|"FRUSTRATED"
 }
+When isSupportRequest is false, still fill the other fields as best you can (a short neutral description of what the email actually is) — the caller uses isSupportRequest alone to decide whether to act on it.
 Base urgency and sentiment on the actual tone/content, not just keywords.`;
 
 async function extractTicketFields({ subjectHeader, cleanedBody, urgencyHint, isLong }) {
@@ -101,8 +141,12 @@ async function extractTicketFields({ subjectHeader, cleanedBody, urgencyHint, is
     return JSON.parse(raw);
   } catch {
     // Fail safe: never let a malformed model response crash ingestion —
-    // fall back to a minimal ticket the admin can fix by hand.
+    // fall back to a minimal ticket the admin can fix by hand. Defaults
+    // to treating it as a real request, since silently dropping a
+    // genuine customer email on a parse failure is worse than creating
+    // one extra ticket to review.
     return {
+      isSupportRequest: true,
       subject: subjectHeader || 'New support ticket',
       description: cleanedBody.slice(0, 300),
       customerName: null,
@@ -113,14 +157,26 @@ async function extractTicketFields({ subjectHeader, cleanedBody, urgencyHint, is
   }
 }
 
-/** Full pipeline entry point used by mailIngest.js. */
+/** Full pipeline entry point used by mailIngest.js.
+ *  Returns { skip: true, reason } for mail that shouldn't become a
+ *  ticket at all, or the usual ticket fields object otherwise. */
 async function extractFromEmail({ fromHeader, subjectHeader, rawBody, receivedAt }) {
+  // Layer 1a — catch obvious system mail before spending any API call.
+  if (isObviousSystemMail({ fromHeader, subjectHeader })) {
+    return { skip: true, reason: 'system_generated_mail' };
+  }
+
   const cleaned = cleanBody(rawBody);
   const urgencyHint = localUrgencyHint(cleaned);
   const { name: headerName, email: senderEmail } = extractHeaderCustomer(fromHeader);
   const isLong = cleaned.length > LONG_EMAIL_CHARS;
 
   const fields = await extractTicketFields({ subjectHeader, cleanedBody: cleaned, urgencyHint, isLong });
+
+  // Layer 2 — Claude's judgment call on anything the header filter missed.
+  if (fields.isSupportRequest === false) {
+    return { skip: true, reason: 'not_a_support_request' };
+  }
 
   return {
     subject: fields.subject || subjectHeader || 'New support ticket',
@@ -134,4 +190,4 @@ async function extractFromEmail({ fromHeader, subjectHeader, rawBody, receivedAt
   };
 }
 
-module.exports = { extractFromEmail, cleanBody, localUrgencyHint };
+module.exports = { extractFromEmail, cleanBody, localUrgencyHint, isObviousSystemMail };

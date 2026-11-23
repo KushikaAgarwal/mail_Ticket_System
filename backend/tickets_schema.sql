@@ -100,3 +100,4 @@ CREATE INDEX IF NOT EXISTS idx_thread_message_id
 -- Needed once for gen_random_uuid() above (built into Postgres 13+,
 -- but this makes sure the extension is enabled either way):
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+

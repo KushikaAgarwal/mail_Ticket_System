@@ -1,16 +1,105 @@
-const API_BASE = import.meta.env.VITE_API_BASE ?? '';
+import { TOKEN_KEY } from '../AuthContext';
+
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:4000';
 
 async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const token = localStorage.getItem(TOKEN_KEY);
+
   const res = await fetch(`${API_BASE}${path}`, {
     ...options,
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(options.headers || {}),
+    },
   });
+
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error?.message || err.error || `API error ${res.status}`);
+    const message =
+      typeof err.error === 'string'
+        ? err.error
+        : err.error?.message || err.error?.error || JSON.stringify(err.error) || res.statusText;
+    throw new Error(message);
   }
+
   return res.json() as Promise<T>;
 }
+
+// ---- Auth ----
+
+export interface LoginResponse {
+  user: {
+    id: string;
+    name: string;
+    email: string;
+    role: string;
+  };
+  token: string;
+}
+
+// ── REPLACE the existing login() function with this ──────────────────
+export async function login(email: string, password: string, zoneId?: number): Promise<LoginResponse> {
+  return apiFetch<LoginResponse>('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email, password, zoneId }),
+  });
+}
+
+export async function getAllCustomerSupport(): Promise<TeamUser[]> {
+  const data = await apiFetch<{ users: TeamUser[] }>('/api/customer-support/all');
+  return data.users;
+}
+ 
+// ---- Team management ----
+
+export interface TeamUser {
+  id: string;
+  name: string;
+  email: string;
+  role: string;
+  zoneId?: number;
+  zoneName?: string;
+}
+
+export interface Zone {
+  id: number;
+  name: string;
+}
+
+export async function getTeam(role?: string): Promise<TeamUser[]> {
+  const query = role ? `?role=${encodeURIComponent(role)}` : '';
+  const data = await apiFetch<{ users: TeamUser[] }>(`/api/users${query}`);
+  return data.users;
+}
+
+export interface CreateTeamMemberInput {
+  name: string;
+  email: string;
+  password: string;
+  role: string;
+  zoneId?: number;
+}
+
+export async function createTeamMember(input: {
+  name: string;
+  email: string;
+  password: string;
+  role: string;
+  zoneId?: number;
+}): Promise<TeamUser> {
+  const data = await apiFetch<{ user: TeamUser }>('/api/users', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+  return data.user;
+}
+export async function getZones(): Promise<Zone[]> {
+  const data = await apiFetch<{ zones: Zone[] }>('/api/zones');
+  return data.zones;
+}
+
+// ---- Tickets ----
 
 export interface StatusHistoryEntry {
   status: string;
@@ -47,10 +136,28 @@ export interface CommentEntry {
   visible?: boolean; // undefined/true = visible to customer, false = hidden
 }
 
+export interface TicketVariables {
+  subject: string;
+  description: string;
+  customerName: string;
+  customerEmail: string;
+  productOrCategory: string;
+  urgency: string;
+  sentiment: string;
+  ticketStatus: string;
+  receivedAt: string;
+  assignedEngineerId?: string;
+  assignedEngineerName?: string;
+  // Anything not listed above (like assignmentLocked, which the backend
+  // sends as a real boolean, not a string) falls through to this looser
+  // type — keeps the named fields strict while still allowing that one.
+  [key: string]: string | boolean | undefined;
+}
+
 export interface TicketDetail {
   processInstanceId: string;
-  taskId: string | null; // null once the ticket is closed — status/comment actions disable
-  variables: Record<string, string>;
+  taskId: string | null;
+  variables: TicketVariables;
   comments: CommentEntry[];
 }
 
@@ -61,6 +168,18 @@ export async function getTickets(): Promise<TicketSummary[]> {
 
 export async function getTicket(id: string): Promise<TicketDetail> {
   return apiFetch<TicketDetail>(`/api/tickets/${id}`);
+}
+
+export async function getCustomerSupportForZone(zoneId: number): Promise<TeamUser[]> {
+  const data = await apiFetch<{ users: TeamUser[] }>(`/api/customer-support?zoneId=${zoneId}`);
+  return data.users;
+}
+
+export async function assignTicket(id: string, engineerId: string, engineerName: string): Promise<void> {
+  await apiFetch(`/api/tickets/${id}/assign`, {
+    method: 'PUT',
+    body: JSON.stringify({ engineerId, engineerName }),
+  });
 }
 
 export async function addTicketComment(
@@ -124,5 +243,21 @@ export async function createTicketFromCall(
   return apiFetch(`/api/calls/${callId}/create-ticket`, {
     method: 'POST',
     body: JSON.stringify(data),
+  });
+}
+
+// ── ADD these two functions to ticketApi.ts ──────────────────────────
+
+export async function forgotPassword(email: string): Promise<{ success: boolean; message: string }> {
+  return apiFetch('/api/auth/forgot-password', {
+    method: 'POST',
+    body: JSON.stringify({ email }),
+  });
+}
+
+export async function resetPassword(token: string, newPassword: string): Promise<{ success: boolean }> {
+  return apiFetch('/api/auth/reset-password', {
+    method: 'POST',
+    body: JSON.stringify({ token, newPassword }),
   });
 }

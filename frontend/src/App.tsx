@@ -6,8 +6,11 @@ import Loginpage from "./pages/Loginpage";
 import Dashboard from "./pages/Dashboard";
 import TicketsList from "./pages/TicketsList";
 import TicketDetail from "./pages/TicketDetail";
+import ForgotPassword from "./pages/ForgotPassword";
+import ResetPassword from "./pages/ResetPassword";
 import AgentExtension from "./pages/AgentExtension";
 import TicketTrack from "./pages/TicketTrack";
+import Team from "./pages/Team";
 function PrivateRoute({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
   if (!user) return <Navigate to="/login" replace />;
@@ -45,6 +48,16 @@ export default function App() {
             }
           />
           <Route path="/track/:id" element={<TicketTrack />} />
+          <Route
+            path="/team"
+            element={
+              <PrivateRoute>
+                <Team />
+              </PrivateRoute>
+            }
+          />
+          <Route path="/forgot-password" element={<ForgotPassword />} />
+<Route path="/reset-password/:token" element={<ResetPassword />} />
           <Route path="*" element={<Navigate to="/" replace />} />
           <Route
   path="/agent"

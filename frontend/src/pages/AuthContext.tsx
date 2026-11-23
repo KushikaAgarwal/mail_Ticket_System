@@ -1,18 +1,28 @@
 import React, { createContext, useContext, useState } from 'react';
 
+
+
 export interface AuthUser {
   id: string;
   name: string;
   email: string;
-  role: 'SUPER_ADMIN' | 'ZONE_MANAGER' | 'ZONE_ADMIN' | 'ENGINEER' | 'CUSTOMER_CARE';
+  role: 'SUPER_ADMIN' | 'SUPERVISOR' | 'ZONAL_ADMIN' | 'ZONAL_EXECUTIVE' | 'CUSTOMER_SUPPORT';
+  zoneId?: number | null;
+  zoneName?: string;
 }
 interface AuthCtx {
   user: AuthUser | null;
-  login: (user: AuthUser) => void;
+  token: string | null;
+  login: (user: AuthUser, token: string) => void;
   logout: () => void;
 }
 
-const AuthContext = createContext<AuthCtx>({ user: null, login: () => {}, logout: () => {} });
+const AuthContext = createContext<AuthCtx>({
+  user: null,
+  token: null,
+  login: () => {},
+  logout: () => {},
+});
 
 export const useAuth = () => useContext(AuthContext);
 
@@ -20,7 +30,8 @@ export function getInitials(user: Pick<AuthUser, 'name'>): string {
   return user.name.split(' ').map((p) => p[0]).join('').slice(0, 2).toUpperCase();
 }
 
-const STORAGE_KEY = 'mailMgmtAdminUser';
+export const STORAGE_KEY = 'mailMgmtAdminUser';
+export const TOKEN_KEY = 'mailMgmtAdminToken';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(() => {
@@ -32,15 +43,31 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   });
 
-  const login = (u: AuthUser) => {
+  const [token, setToken] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(TOKEN_KEY);
+    } catch {
+      return null;
+    }
+  });
+
+  const login = (u: AuthUser, t: string) => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(u));
+    localStorage.setItem(TOKEN_KEY, t);
     setUser(u);
+    setToken(t);
   };
 
   const logout = () => {
     localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(TOKEN_KEY);
     setUser(null);
+    setToken(null);
   };
 
-  return <AuthContext.Provider value={{ user, login, logout }}>{children}</AuthContext.Provider>;
+  return (
+    <AuthContext.Provider value={{ user, token, login, logout }}>
+      {children}
+    </AuthContext.Provider>
+  );
 }

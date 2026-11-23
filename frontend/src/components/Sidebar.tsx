@@ -1,6 +1,6 @@
 import React from 'react';
 import { NavLink } from 'react-router-dom';
-import { InboxIcon, LayoutDashboardIcon, MailIcon, PhoneIcon, LogOutIcon } from 'lucide-react';
+import { InboxIcon, LayoutDashboardIcon, MailIcon, PhoneIcon, LogOutIcon, UsersIcon } from 'lucide-react';
 import { useAuth } from '../pages/AuthContext';
 
 export default function Sidebar() {
@@ -26,6 +26,11 @@ export default function Sidebar() {
       <NavLink to="/agent" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
         <PhoneIcon className="ico" /> Agent Extension
       </NavLink>
+      {user && user.role !== 'CUSTOMER_SUPPORT' && (
+        <NavLink to="/team" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
+          <UsersIcon className="ico" /> Team
+        </NavLink>
+      )}
 
       <div style={{ marginTop: 'auto' }}>
         {user && (

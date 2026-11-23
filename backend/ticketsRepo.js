@@ -3,7 +3,7 @@
  * file talks to Flowable. flowableClient.js keeps owning workflow (which
  * step a ticket is on, task claim/complete); this file owns everything
  * else (ticket content, comments, thread, status history, attachments,
- * notification log, engineers cache).
+ * notification log, zone/role-based scoping and the assignment lock).
  *
  * Every function returns plain JS objects (already camelCase where it
  * matters) so callers in server.js/mailIngest.js/callIngest.js never see
@@ -31,6 +31,9 @@ function ticketRowToObject(row) {
     ticketStatus: row.ticket_status,
     assignedEngineerId: row.assigned_engineer_id,
     assignedEngineerName: row.assigned_engineer_name,
+    assignedByRole: row.assigned_by_role,
+    zoneId: row.zone_id,
+    assignmentLocked: row.assignment_locked,
     receivedAt: row.received_at,
     lastActivityAt: row.last_activity_at,
     createdAt: row.created_at,
@@ -61,8 +64,7 @@ function commentRowToObject(row) {
 /** Reserves the next ticket number up front (needed before the ticket row
  *  can be inserted, since the number gets embedded in the acknowledgement
  *  email's subject/link). Postgres sequences hand out a unique number even
- *  under heavy concurrent load or multiple backend instances — this is
- *  the direct replacement for the old ticketCounter.json file. */
+ *  under heavy concurrent load or multiple backend instances. */
 async function getNextTicketNumber() {
   const { rows } = await query(`SELECT nextval('ticket_number_seq') AS n`);
   return Number(rows[0].n);
@@ -136,18 +138,35 @@ async function getTicketByBusinessKey(businessKey) {
   return ticketRowToObject(rows[0]);
 }
 
-/** Fast, indexed replacement for getInstanceIdByTicketNumber's full scan
- *  over every Flowable process instance. */
+async function getTicketByBusinessKeyIn(candidateIds) {
+  if (!candidateIds || !candidateIds.length) return null;
+  const { rows } = await query(
+    `SELECT * FROM tickets WHERE business_key = ANY($1::text[]) LIMIT 1`,
+    [candidateIds]
+  );
+  return ticketRowToObject(rows[0]);
+}
+
+/** Fast, indexed replacement for a full scan over every Flowable process
+ *  instance. */
 async function getInstanceIdByTicketNumber(ticketNumber) {
-  const ticket = await getTicketByNumber(Number(ticketNumber));
+  const n = Number(ticketNumber);
+  if (!Number.isInteger(n)) return null;
+  const ticket = await getTicketByNumber(n);
   return ticket ? ticket.processInstanceId : null;
 }
 
-/** Listing with optional filters — status, and (for the ENGINEER role)
- *  restricted to one assignee. Ordered newest-activity-first, same as the
- *  in-memory sort server.js used to do after pulling everything from
- *  Flowable. */
-async function listTickets({ status, assignedEngineerId, limit = 500 } = {}) {
+/** Listing with optional filters — status, and role-based scoping.
+ *  `scope` is derived server-side from the requester's JWT in server.js,
+ *  never from client input:
+ *    - null                            → no extra restriction
+ *                                         (SUPER_ADMIN, SUPERVISOR, ZONAL_ADMIN)
+ *    - { onlyUnassignedOrOwnZone: id }  → ZONAL_EXECUTIVE: unassigned
+ *                                         tickets anywhere, plus ones
+ *                                         already in their own zone
+ *    - { assignedEngineerId: id }       → CUSTOMER_SUPPORT: only their own
+ */
+async function listTickets({ status, scope, limit = 500 } = {}) {
   const clauses = [];
   const params = [];
 
@@ -155,8 +174,12 @@ async function listTickets({ status, assignedEngineerId, limit = 500 } = {}) {
     params.push(status);
     clauses.push(`ticket_status = $${params.length}`);
   }
-  if (assignedEngineerId) {
-    params.push(assignedEngineerId);
+
+  if (scope?.onlyUnassignedOrOwnZone) {
+    params.push(scope.onlyUnassignedOrOwnZone);
+    clauses.push(`(assigned_engineer_id IS NULL OR zone_id = $${params.length})`);
+  } else if (scope?.assignedEngineerId) {
+    params.push(scope.assignedEngineerId);
     clauses.push(`assigned_engineer_id = $${params.length}`);
   }
 
@@ -168,6 +191,44 @@ async function listTickets({ status, assignedEngineerId, limit = 500 } = {}) {
     params
   );
   return rows.map(ticketRowToObject);
+}
+
+/** Assigns (or reassigns) a ticket to a customer-support agent.
+ *
+ *  Lock rule: once a ZONAL_EXECUTIVE has made the assignment, no further
+ *  ZONAL_EXECUTIVE — from ANY zone — can change it. The DB update simply
+ *  matches zero rows in that case, so there's no separate race-prone
+ *  "check then update" step; the WHERE clause IS the enforcement.
+ *  SUPER_ADMIN / SUPERVISOR / ZONAL_ADMIN bypass the lock (override). */
+async function assignEngineer(processInstanceId, { engineerId, engineerName, assignedById, assignedByRole, zoneId }) {
+  // NEW — Zonal Executive can now reassign too
+const canOverride = ['SUPER_ADMIN', 'SUPERVISOR', 'ZONAL_ADMIN', 'ZONAL_EXECUTIVE'].includes(assignedByRole);
+  const lockClause = canOverride ? '' : 'AND assignment_locked = FALSE';
+
+  const { rows } = await query(
+    `UPDATE tickets
+        SET assigned_engineer_id = $1,
+            assigned_engineer_name = $2,
+            assigned_by_id = $3,
+            assigned_by_role = $4,
+            zone_id = COALESCE($5, zone_id),
+            assignment_locked = TRUE,
+            last_activity_at = now()
+      WHERE process_instance_id = $6 ${lockClause}
+      RETURNING *`,
+    [engineerId, engineerName || engineerId, assignedById, assignedByRole, zoneId || null, processInstanceId]
+  );
+
+  if (!rows[0]) {
+    // Either the ticket doesn't exist, or it's locked and this caller
+    // can't override it — tell those apart for a clearer error upstream.
+    const existing = await getTicketByProcessInstanceId(processInstanceId);
+    if (!existing) return { notFound: true };
+    if (existing.assignmentLocked) return { locked: true, ticket: existing };
+    return { notFound: true };
+  }
+
+  return { ticket: ticketRowToObject(rows[0]) };
 }
 
 async function updateTicketStatus(processInstanceId, status, changedBy = null) {
@@ -186,17 +247,6 @@ async function updateTicketStatus(processInstanceId, status, changedBy = null) {
     );
     return ticketRowToObject(rows[0]);
   });
-}
-
-async function assignEngineer(processInstanceId, engineerId, engineerName) {
-  const { rows } = await query(
-    `UPDATE tickets
-       SET assigned_engineer_id = $1, assigned_engineer_name = $2, last_activity_at = now()
-     WHERE process_instance_id = $3
-     RETURNING *`,
-    [engineerId, engineerName || engineerId, processInstanceId]
-  );
-  return ticketRowToObject(rows[0]);
 }
 
 async function touchLastActivity(processInstanceId) {
@@ -256,9 +306,9 @@ async function addThreadMessageId(processInstanceId, messageId) {
   );
 }
 
-/** Indexed replacement for findTicketByMessageId's full scan over every
- *  running process instance's threadMessageIds JSON array. Returns the
- *  matching ticket's process_instance_id, or null. */
+/** Indexed replacement for a full scan over every running process
+ *  instance's threadMessageIds. Returns the matching ticket's
+ *  process_instance_id, or null. */
 async function findTicketIdByMessageId(candidateIds) {
   if (!candidateIds || !candidateIds.length) return null;
   const { rows } = await query(
@@ -332,34 +382,13 @@ async function getNotificationLog(processInstanceId) {
   return rows;
 }
 
-// ── engineers cache ──────────────────────────────────────────────────
-
-/** Overwrites the whole cache with a fresh list from Flowable. Call this
- *  from a short interval timer (e.g. every 5 min) in server.js — see
- *  README notes. Cheap because it's a handful of rows. */
-async function refreshEngineersCache(engineers) {
-  return withTransaction(async (client) => {
-    await client.query(`DELETE FROM engineers_cache`);
-    for (const e of engineers) {
-      await client.query(
-        `INSERT INTO engineers_cache (id, name, email) VALUES ($1,$2,$3)`,
-        [e.id, e.name, e.email]
-      );
-    }
-  });
-}
-
-async function listCachedEngineers() {
-  const { rows } = await query(`SELECT id, name, email, last_synced_at FROM engineers_cache ORDER BY name ASC`);
-  return rows.map((r) => ({ id: r.id, name: r.name, email: r.email, lastSyncedAt: r.last_synced_at }));
-}
-
 module.exports = {
   getNextTicketNumber,
   createTicket,
   getTicketByProcessInstanceId,
   getTicketByNumber,
   getTicketByBusinessKey,
+  getTicketByBusinessKeyIn,
   getInstanceIdByTicketNumber,
   listTickets,
   updateTicketStatus,
@@ -375,6 +404,4 @@ module.exports = {
   getAttachments,
   logNotification,
   getNotificationLog,
-  refreshEngineersCache,
-  listCachedEngineers,
 };
