@@ -32,7 +32,9 @@ function ticketRowToObject(row) {
     assignedEngineerId: row.assigned_engineer_id,
     assignedEngineerName: row.assigned_engineer_name,
     assignedByRole: row.assigned_by_role,
+    assignedById: row.assigned_by_id,
     zoneId: row.zone_id,
+    zoneName: row.zone_name || null,
     assignmentLocked: row.assignment_locked,
     receivedAt: row.received_at,
     lastActivityAt: row.last_activity_at,
@@ -166,31 +168,59 @@ async function getInstanceIdByTicketNumber(ticketNumber) {
  *                                         already in their own zone
  *    - { assignedEngineerId: id }       → CUSTOMER_SUPPORT: only their own
  */
-async function listTickets({ status, scope, limit = 500 } = {}) {
+async function listTickets({ status, scope, zoneId, limit = 500 } = {}) {
   const clauses = [];
   const params = [];
 
   if (status) {
     params.push(status);
-    clauses.push(`ticket_status = $${params.length}`);
+    clauses.push(`t.ticket_status = $${params.length}`);
+  }
+
+  // Zone filter used by Super Admin / Supervisor.
+  // zoneId = 'none' -> tickets not yet assigned to any zone.
+  if (zoneId === 'none') {
+    clauses.push(`t.zone_id IS NULL`);
+  } else if (zoneId) {
+    params.push(Number(zoneId));
+    clauses.push(`t.zone_id = $${params.length}`);
   }
 
   if (scope?.onlyUnassignedOrOwnZone) {
     params.push(scope.onlyUnassignedOrOwnZone);
-    clauses.push(`(assigned_engineer_id IS NULL OR zone_id = $${params.length})`);
+    clauses.push(`(t.assigned_engineer_id IS NULL OR t.zone_id = $${params.length})`);
   } else if (scope?.assignedEngineerId) {
     params.push(scope.assignedEngineerId);
-    clauses.push(`assigned_engineer_id = $${params.length}`);
+    clauses.push(`t.assigned_engineer_id = $${params.length}`);
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
   params.push(limit);
 
   const { rows } = await query(
-    `SELECT * FROM tickets ${where} ORDER BY last_activity_at DESC LIMIT $${params.length}`,
+    `SELECT t.*, z.name AS zone_name
+       FROM tickets t LEFT JOIN zones z ON z.id = t.zone_id
+       ${where}
+      ORDER BY t.last_activity_at DESC LIMIT $${params.length}`,
     params
   );
   return rows.map(ticketRowToObject);
+}
+
+/** Ticket counts per zone and status — powers the Super Admin / Supervisor
+ *  dashboard. Tickets with no zone yet are reported as zoneId = null. */
+async function getZoneStats() {
+  const { rows } = await query(
+    `SELECT t.zone_id, z.name AS zone_name, t.ticket_status, COUNT(*)::int AS count
+       FROM tickets t LEFT JOIN zones z ON z.id = t.zone_id
+      GROUP BY t.zone_id, z.name, t.ticket_status`
+  );
+  return rows.map((r) => ({
+    zoneId: r.zone_id,
+    zoneName: r.zone_name || 'Unassigned',
+    status: r.ticket_status,
+    count: r.count,
+  }));
 }
 
 /** Assigns (or reassigns) a ticket to a customer-support agent.
@@ -403,5 +433,6 @@ module.exports = {
   addAttachment,
   getAttachments,
   logNotification,
+  getZoneStats,
   getNotificationLog,
 };

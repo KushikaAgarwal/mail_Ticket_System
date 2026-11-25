@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { MailIcon, EyeIcon, EyeOffIcon } from 'lucide-react';
+import { EyeIcon, EyeOffIcon } from 'lucide-react';
 import { useAuth } from './AuthContext';
 import { login as loginApi, getZones, Zone } from './services/ticketApi';
 
@@ -36,65 +36,68 @@ export default function Loginpage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center" style={{ background: 'var(--bg)' }}>
-      <form onSubmit={submit} className="card" style={{ width: 360, padding: 28 }}>
-        <div className="flex items-center gap-2 mb-6">
-          <div className="brand-logo" style={{ background: 'linear-gradient(135deg,#3b82f6,#0ea5a3)' }}>
-            <MailIcon className="w-4 h-4 text-white" />
-          </div>
+    <div className="login-wrap">
+      <form onSubmit={submit} className="login-card">
+        <div className="brand" style={{ padding: 0, marginBottom: 20 }}>
+          <div className="brand-logo">PS</div>
           <div>
-            <div className="font-semibold text-gray-800">PS QuickIt</div>
-            <div className="text-xs text-gray-400">Admin sign in</div>
+            <div className="brand-name">PS QuickIt</div>
+            <div className="brand-sub">Support desk</div>
           </div>
         </div>
 
-        <label className="text-xs text-gray-500 mb-1 block">Email</label>
-        <input value={email} onChange={(e) => setEmail(e.target.value)} type="email"
-          className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm mb-4" placeholder="you@company.com" />
+        <h2>Log in to your account</h2>
+        <div className="hint">Use the email and password you were given.</div>
 
-        <label className="text-xs text-gray-500 mb-1 block">Password</label>
-        <div className="relative mb-4">
-          <input
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            type={showPassword ? 'text' : 'password'}
-            className="w-full px-3 py-2 pr-10 border border-gray-300 rounded-lg text-sm"
-            placeholder="••••••••"
-          />
-          <button
-            type="button"
-            onClick={() => setShowPassword((v) => !v)}
-            tabIndex={-1}
-            aria-label={showPassword ? 'Hide password' : 'Show password'}
-            className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+        {error && <div className="alert alert-danger">{error}</div>}
+
+        <div className="form-row">
+          <label>Email</label>
+          <input value={email} onChange={(e) => setEmail(e.target.value)} type="email" placeholder="you@company.com" autoFocus />
+        </div>
+
+        <div className="form-row">
+          <label>Password</label>
+          <div style={{ position: 'relative' }}>
+            <input
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              type={showPassword ? 'text' : 'password'}
+              placeholder="Enter password"
+              style={{ paddingRight: 36 }}
+            />
+            <button
+              type="button"
+              onClick={() => setShowPassword((v) => !v)}
+              tabIndex={-1}
+              aria-label={showPassword ? 'Hide password' : 'Show password'}
+              style={{ position: 'absolute', right: 8, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-soft)' }}
+            >
+              {showPassword ? <EyeOffIcon size={16} /> : <EyeIcon size={16} />}
+            </button>
+          </div>
+        </div>
+
+        <div className="form-row">
+          <label>Zone</label>
+          <select
+            value={zoneId}
+            onChange={(e) => setZoneId(e.target.value === '' ? '' : Number(e.target.value))}
           >
-            {showPassword ? <EyeOffIcon className="w-4 h-4" /> : <EyeIcon className="w-4 h-4" />}
-          </button>
+            <option value="">Not applicable (Super Admin / Supervisor)</option>
+            {zones.map((z) => (
+              <option key={z.id} value={z.id}>{z.name}</option>
+            ))}
+          </select>
         </div>
 
-        <label className="text-xs text-gray-500 mb-1 block">Zone (only for zone-based accounts)</label>
-        <select
-          value={zoneId}
-          onChange={(e) => setZoneId(e.target.value === '' ? '' : Number(e.target.value))}
-          className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm mb-4"
-        >
-          <option value="">Not applicable / Super Admin / Supervisor</option>
-          {zones.map((z) => (
-            <option key={z.id} value={z.id}>{z.name}</option>
-          ))}
-        </select>
-
-        {error && <div className="text-xs text-red-500 mb-4">{error}</div>}
-
-        <div className="text-right mb-4">
-          <Link to="/forgot-password" className="text-xs text-blue-600 hover:underline">
-            Forgot password?
-          </Link>
-        </div>
-
-        <button type="submit" disabled={loading} className="btn btn-primary w-full justify-center">
-          {loading ? 'Signing in…' : 'Sign in'}
+        <button type="submit" disabled={loading} className="btn btn-primary login-btn" style={{ justifyContent: 'center', height: 40 }}>
+          {loading ? 'Signing in…' : 'Log in'}
         </button>
+
+        <div className="login-foot">
+          <Link to="/forgot-password" style={{ color: 'var(--primary)' }}>Forgot password?</Link>
+        </div>
       </form>
     </div>
   );

@@ -1,10 +1,34 @@
-import React from 'react';
-import { NavLink } from 'react-router-dom';
-import { InboxIcon, LayoutDashboardIcon, MailIcon, PhoneIcon, LogOutIcon, UsersIcon } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { Link, NavLink, useLocation } from 'react-router-dom';
+import { InboxIcon, LayoutDashboardIcon, UsersIcon } from 'lucide-react';
 import { useAuth } from '../pages/AuthContext';
+import { getZones, Zone } from '../pages/services/ticketApi';
+import { ALL_ZONE_ROLES, zoneColor } from '../constants/ticketStatus';
+
+// Sidebar label for the Team page, per role. Customer Support has no entry,
+// so they don't see the Administration section at all.
+const TEAM_LABEL: Record<string, string> = {
+  SUPER_ADMIN: 'Team',
+  SUPERVISOR: 'Zonal Admins',
+  ZONAL_ADMIN: 'Managers',
+  MANAGER: 'Leads',
+  LEAD: 'My team',
+};
 
 export default function Sidebar() {
-  const { user, logout } = useAuth();
+  const { user } = useAuth();
+  const location = useLocation();
+  const [zones, setZones] = useState<Zone[]>([]);
+
+  const seesAllZones = !!user && ALL_ZONE_ROLES.includes(user.role);
+
+  useEffect(() => {
+    if (seesAllZones) getZones().then(setZones).catch(() => {});
+  }, [seesAllZones]);
+
+  const activeZone = new URLSearchParams(location.search).get('zone');
+  const onTickets = location.pathname === '/tickets';
+  const link = (isActive: boolean) => `nav-item${isActive ? ' active' : ''}`;
 
   return (
     <aside className="sidebar">
@@ -12,46 +36,43 @@ export default function Sidebar() {
         <div className="brand-logo">PS</div>
         <div>
           <div className="brand-name">PS QuickIt</div>
-          <div className="brand-sub">csdsmartcard.helpdesk@psquickit.com</div>
+          <div className="brand-sub">Support desk</div>
         </div>
       </div>
 
       <div className="nav-section">Workspace</div>
-      <NavLink to="/" end className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
+      <NavLink to="/" end className={({ isActive }) => link(isActive)}>
         <LayoutDashboardIcon className="ico" /> Dashboard
       </NavLink>
-      <NavLink to="/tickets" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
-        <InboxIcon className="ico" /> Tickets
+      <NavLink to="/tickets" end className={() => link(onTickets && !activeZone)}>
+        <InboxIcon className="ico" /> {seesAllZones ? 'All tickets' : 'Tickets'}
       </NavLink>
-      <NavLink to="/agent" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
-        <PhoneIcon className="ico" /> Agent Extension
-      </NavLink>
-      {user && user.role !== 'CUSTOMER_SUPPORT' && (
-        <NavLink to="/team" className={({ isActive }) => `nav-item${isActive ? ' active' : ''}`}>
-          <UsersIcon className="ico" /> Team
-        </NavLink>
+
+      {seesAllZones && (
+        <>
+          <div className="nav-section">Zones</div>
+          {zones.map((z) => (
+            <Link key={z.id} to={`/tickets?zone=${z.id}`} className={link(onTickets && activeZone === String(z.id))}>
+              <span className="zone-dot" style={{ background: zoneColor(z.name) }} /> {z.name}
+            </Link>
+          ))}
+          <Link to="/tickets?zone=none" className={link(onTickets && activeZone === 'none')}>
+            <span className="zone-dot" style={{ background: zoneColor('Unassigned') }} /> Unassigned
+          </Link>
+        </>
       )}
 
-      <div style={{ marginTop: 'auto' }}>
-        {user && (
-          <div className="nav-section" style={{ marginBottom: 4 }}>
-            Signed in as <strong>{user.name}</strong>
-          </div>
-        )}
-        <button
-          type="button"
-          onClick={logout}
-          className="nav-item"
-          style={{ width: '100%', background: 'none', border: 'none', cursor: 'pointer', textAlign: 'left' }}
-        >
-          <LogOutIcon className="ico" /> Logout
-        </button>
-      </div>
+      {user && TEAM_LABEL[user.role] && (
+        <>
+          <div className="nav-section">Administration</div>
+          <NavLink to="/team" className={({ isActive }) => link(isActive)}>
+            <UsersIcon className="ico" /> {TEAM_LABEL[user.role]}
+          </NavLink>
+        </>
+      )}
 
-      <div className="sidebar-footer">
-        <MailIcon className="ico" style={{ display: 'inline', width: 12, height: 12, marginRight: 4 }} />
-        Tickets are auto-created from incoming support mail via NLP + Claude extraction.
-      </div>
+      <div style={{ flex: 1 }} />
+      <div className="sidebar-footer">Tickets are created automatically from support mail.</div>
     </aside>
   );
 }

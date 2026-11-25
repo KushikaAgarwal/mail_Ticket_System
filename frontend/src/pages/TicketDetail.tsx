@@ -11,7 +11,7 @@ import {
   updateTicketStatus,
   getTicketHistory,
   setCommentVisibility,
-  getCustomerSupportForZone,
+  getMyAssignableAgents,
   getAllCustomerSupport,
   assignTicket,
   TicketDetail as TicketDetailType,
@@ -19,10 +19,11 @@ import {
   TeamUser,
 } from './services/ticketApi';
 
-const ASSIGN_ROLES = ['ZONAL_EXECUTIVE', 'ZONAL_ADMIN', 'SUPERVISOR', 'SUPER_ADMIN'];
-// NEW
-const OVERRIDE_ROLES = ['SUPER_ADMIN', 'SUPERVISOR', 'ZONAL_ADMIN', 'ZONAL_EXECUTIVE'];
-const ZONE_SCOPED_ASSIGN_ROLES = ['ZONAL_EXECUTIVE', 'ZONAL_ADMIN'];
+// Who can assign tickets at all.
+const ASSIGN_ROLES = ['LEAD', 'MANAGER', 'ZONAL_ADMIN', 'SUPERVISOR', 'SUPER_ADMIN'];
+// Who can override ANY existing assignment (a Lead can only change their own).
+const OVERRIDE_ROLES = ['SUPER_ADMIN', 'SUPERVISOR', 'ZONAL_ADMIN', 'MANAGER'];
+// Roles whose roster spans every zone.
 const ALL_ZONE_ASSIGN_ROLES = ['SUPER_ADMIN', 'SUPERVISOR'];
 
 function rosterLabel(u: TeamUser): string {
@@ -63,20 +64,20 @@ export default function TicketDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [taskId]);
 
-  // Zone-scoped roles (Zonal Executive, Zonal Admin) only ever see their
-  // own zone's roster. Super Admin / Supervisor see every zone's agents,
-  // labeled with their zone, since they're allowed to assign anywhere.
+  // Roster is decided by the backend from the verified token:
+  //   Lead -> their own team · Manager / Zonal Admin -> their zone ·
+  //   Super Admin / Supervisor -> every agent (labelled with zone).
   useEffect(() => {
     if (!user) return;
-    if (ZONE_SCOPED_ASSIGN_ROLES.includes(user.role) && user.zoneId) {
-      getCustomerSupportForZone(user.zoneId).then(setRoster).catch(() => {});
-    } else if (ALL_ZONE_ASSIGN_ROLES.includes(user.role)) {
+    if (ALL_ZONE_ASSIGN_ROLES.includes(user.role)) {
       getAllCustomerSupport().then(setRoster).catch(() => {});
+    } else if (ASSIGN_ROLES.includes(user.role)) {
+      getMyAssignableAgents().then(setRoster).catch(() => {});
     } else {
       setRoster([]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user?.role, user?.zoneId]);
+  }, [user?.role, user?.id]);
 
   const handleAddComment = async (text: string, sendMail: boolean) => {
     if (!taskId) return;
@@ -129,8 +130,10 @@ export default function TicketDetail() {
 
   const isLocked = v.assignmentLocked === 'true' || v.assignmentLocked === true;
   const canOverrideLock = !!user && OVERRIDE_ROLES.includes(user.role);
-  const showAssignPicker = canAssign && (!isLocked || canOverrideLock);
-  const showLockedNotice = isLocked && !canOverrideLock;
+  // A Lead may change an assignment only if they made it themselves.
+  const assignedByMe = isLocked && !!user && !!v.assignedById && v.assignedById === user.id;
+  const showAssignPicker = canAssign && (!isLocked || canOverrideLock || assignedByMe);
+  const showLockedNotice = canAssign && isLocked && !canOverrideLock && !assignedByMe;
 
   return (
     <div>
@@ -216,11 +219,15 @@ export default function TicketDetail() {
               )}
 
               {showAssignPicker && roster.length === 0 && (
-                <span className="text-xs text-gray-400">No Customer Support agents available to assign.</span>
+                <span className="text-xs text-gray-400">
+                  {user?.role === 'LEAD'
+                    ? 'You have no Customer Support agents in your team yet.'
+                    : 'No Customer Support agents available to assign.'}
+                </span>
               )}
 
               {showLockedNotice && (
-                <span className="text-xs text-gray-400">Locked — assigned by a zonal executive</span>
+                <span className="text-xs text-gray-400">Locked — assigned by another lead</span>
               )}
             </div>
           )}

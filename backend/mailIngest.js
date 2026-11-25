@@ -1,15 +1,15 @@
-
 require('dotenv').config();
-const ticketsRepo = require('./ticketsRepo');
 const imaps = require('imap-simple');
 const { simpleParser } = require('mailparser');
+const pLimit = require('p-limit');
+
+const ticketsRepo = require('./ticketsRepo');
+const usersRepo = require('./usersRepo');
 const { startTicketProcess } = require('./flowableClient');
 const { extractFromEmail } = require('./nlpExtract');
-const usersRepo = require('./usersRepo');
-const { notifyZonalStaffOfNewTicket } = require('./emailService'); 
-const { sendAcknowledgementEmail } = require('./emailService');
 const { extractReplyText } = require('./replyExtract');
-const pLimit = require('p-limit');
+const { sendAcknowledgementEmail } = require('./emailService');
+
 const imapConfig = {
   imap: {
     user: process.env.EMAIL,
@@ -38,9 +38,7 @@ function extractTicketIdFromSubject(subject) {
 /** Resolves an inbound mail to an existing ticket, if it's a follow-up.
  *  Tries the ticket number embedded in the subject first, then the
  *  reply-thread's own recorded message-ids, then falls back to matching
- *  against the ORIGINAL customer message-id (stored as business_key) —
- *  covers cases where the acknowledgement email's own message-id never
- *  got recorded in ticket_thread_messages. */
+ *  against the ORIGINAL customer message-id (stored as business_key). */
 async function resolveExistingTicket(parsed) {
   const subjectTicketNumber = extractTicketIdFromSubject(parsed.subject);
 
@@ -72,12 +70,19 @@ async function resolveExistingTicket(parsed) {
   );
   return null;
 }
+
 async function processMessage(connection, message) {
   const all = message.parts.find((p) => p.which === '');
   const parsed = await simpleParser(all.body);
 
   const messageId = parsed.messageId || `${message.attributes.uid}@no-message-id`;
-
+// Never turn our own outgoing mail (old "[Internal]" alerts, etc.) into tickets.
+  const fromAddress = (parsed.from?.value?.[0]?.address || '').toLowerCase();
+  const ownAddress = (process.env.EMAIL || '').toLowerCase();
+  if ((ownAddress && fromAddress === ownAddress) || /^\s*\[Internal\]/i.test(parsed.subject || '')) {
+    await connection.addFlags(message.attributes.uid, '\\Seen');
+    return { skipped: true, reason: 'own-mail', messageId };
+  }
   // Covers both "we already created a ticket for this exact email" and
   // "we already appended this exact reply to a ticket's thread".
   if (await alreadyTicketed(messageId)) return { skipped: true, messageId };
@@ -114,7 +119,6 @@ async function processMessage(connection, message) {
     receivedAt: parsed.date ? parsed.date.toISOString() : new Date().toISOString(),
   });
 
-
   if (fields.skip) {
     console.log(`[mailIngest] skipping non-customer mail (${fields.reason}): "${parsed.subject}"`);
     await connection.addFlags(message.attributes.uid, '\\Seen');
@@ -125,7 +129,7 @@ async function processMessage(connection, message) {
   // shown to the customer in the acknowledgement email/subject tag.
   const ticketNumber = await ticketsRepo.getNextTicketNumber();
 
-  // Flowable variables — kept minimal, since Postgres is now the source
+  // Flowable variables — kept minimal, since Postgres is the source
   // of truth for ticket content. ticketStatus/ticketNumber stay here too
   // because the BPMN gateway and task list still read them.
   const variables = [
@@ -152,17 +156,10 @@ async function processMessage(connection, message) {
     receivedAt: fields.receivedAt,
   });
   await ticketsRepo.addThreadMessageId(instance.id, messageId);
-  const zonalStaff = await usersRepo.listZonalStaffEmails();
-const adminUrl = `${process.env.ADMIN_FRONTEND_BASE || 'http://localhost:5173'}/tickets/${instance.id}`;
-await notifyZonalStaffOfNewTicket({
-  recipients: zonalStaff,
-  subject: fields.subject,
-  ticketId: ticketNumber,
-  ticketAdminUrl: adminUrl,
-  customerName: fields.customerName,
-});
- 
 
+  
+
+  // Acknowledge the customer
   const ticketUrl = `${process.env.FRONTEND_BASE || 'http://localhost:5173'}/track/${instance.id}`;
 
   let info;
@@ -210,9 +207,6 @@ async function runIngestOnce() {
   if (!process.env.EMAIL || !process.env.EMAIL_APP_PASSWORD) {
     throw new Error('EMAIL and EMAIL_APP_PASSWORD must be set in .env');
   }
-  if (!process.env.ANTHROPIC_API_KEY) {
-    throw new Error('ANTHROPIC_API_KEY must be set in .env');
-  }
 
   const connection = await imaps.connect(imapConfig);
   await connection.openBox('INBOX');
@@ -242,18 +236,3 @@ async function runIngestOnce() {
 }
 
 module.exports = { runIngestOnce };
-
-/**
- * Gmail API (OAuth) alternative, if you'd rather not use an app password:
- *   1. Enable the Gmail API in Google Cloud Console for the project owning
- *      the support inbox, create OAuth credentials, get a refresh token
- *      (one-time consent flow).
- *   2. Replace this file's imap-simple calls with googleapis' gmail.users
- *      .messages.list({ q: 'is:unread' }) + .get() to fetch bodies, and
- *      gmail.users.messages.modify() to remove the UNREAD label instead of
- *      connection.addFlags. Everything downstream (extractFromEmail,
- *      startTicketProcess, ticketsRepo, dedupe by Message-Id) stays
- *      identical.
- *   IMAP is simpler to stand up first; swap later if you need push
- *   notifications (Gmail watch()) instead of polling.
- */

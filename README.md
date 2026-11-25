@@ -90,3 +90,12 @@ up real auth before production).
   if `urgency == 'HIGH'` and the task isn't claimed within N minutes.
 - **Gmail API instead of IMAP:** see the comment block at the bottom of
   `backend/mailIngest.js` for the OAuth/push-notification alternative.
+
+
+node seedSuperAdmin.js "Admin" admin2@test.com "Admin@12345"
+
+
+can createthe ticket on hishown on behl od customer,
+
+
+updated to not creta te ticket for mail unasgned 

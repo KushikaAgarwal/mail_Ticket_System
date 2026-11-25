@@ -1,40 +1,13 @@
 /**
- * Hybrid extraction pipeline.
+ * Turns a raw incoming email into ticket fields.
+ * 100% local and free — simple rules, no AI service or API key needed.
  *
- * Layer 1 (local, free, instant) — regex/heuristics:
- *   - strips quoted history ("On ... wrote:"), signatures, disclaimers
- *   - pulls a candidate customer name/email from headers
- *   - cheap keyword-based urgency pre-flag ("urgent", "down", "asap", "!!!")
- *   - filters out obvious system/automated mail (bounces, delivery
- *     failures, out-of-office, auto-replies) BEFORE calling Claude at
- *     all, so no API cost is spent on mail that was never going to
- *     become a ticket
- *
- * Layer 2 (Claude) — only runs on the CLEANED body, not the raw email, so
- * signatures/quoted threads/HTML cruft never burn tokens. Returns strict
- * JSON so it drops straight into Flowable process variables. Also makes
- * the final call on whether this is actually a genuine customer
- * query/complaint — anything that isn't (spam, newsletters, automated
- * notifications the header/subject filter didn't catch) is flagged so
- * mailIngest.js can skip ticket creation.
- *
- * Model choice: Claude Haiku 4.5 by default (fast/cheap, plenty for
- * structured field extraction on a single email). Long or ambiguous emails
- * (> LONG_EMAIL_CHARS) escalate to Claude Sonnet 5 for better judgement on
- * category/sentiment. Override via EXTRACT_MODEL / EXTRACT_MODEL_ESCALATED.
+ *  1. Skip obvious system mail (bounces, auto-replies, no-reply senders).
+ *  2. Clean the body (remove quoted replies and signatures).
+ *  3. Fill in the ticket fields from the email itself + keyword rules.
  */
 
-const Anthropic = require('@anthropic-ai/sdk');
-
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-const MODEL_DEFAULT = process.env.EXTRACT_MODEL || 'claude-haiku-4-5-20251001';
-const MODEL_ESCALATED = process.env.EXTRACT_MODEL_ESCALATED || 'claude-sonnet-5';
-const LONG_EMAIL_CHARS = 2000;
-
-const URGENT_KEYWORDS = ['urgent', 'asap', 'immediately', 'down', 'outage', 'critical', 'not working', 'blocked', 'production'];
-
-// ── Layer 1a: obvious system/automated mail — never even reaches Claude ─
+// ── 1. System / automated mail that should never become a ticket ────────
 const SYSTEM_SENDER_PATTERNS = [
   /mailer-daemon/i,
   /postmaster/i,
@@ -53,50 +26,85 @@ const SYSTEM_SUBJECT_PATTERNS = [
   /automatic reply/i,
   /auto-?reply/i,
   /out of office/i,
-  /^re: \[.*\] support ticket created/i, // our own acknowledgement, if it ever loops back
+  /^re: \[.*\] support ticket created/i, // our own acknowledgement looping back
 ];
 
-/** Fast, free, catches the large majority of non-customer mail (bounces,
- *  auto-replies) purely from headers — no API call needed. */
 function isObviousSystemMail({ fromHeader, subjectHeader }) {
   const from = fromHeader || '';
   const subject = subjectHeader || '';
-  if (SYSTEM_SENDER_PATTERNS.some((p) => p.test(from))) return true;
-  if (SYSTEM_SUBJECT_PATTERNS.some((p) => p.test(subject))) return true;
-  return false;
+  return (
+    SYSTEM_SENDER_PATTERNS.some((p) => p.test(from)) ||
+    SYSTEM_SUBJECT_PATTERNS.some((p) => p.test(subject))
+  );
 }
 
-// ── Layer 1b: cheap local cleanup ────────────────────────────────────────
+// ── 2. Body cleanup ─────────────────────────────────────────────────────
 function cleanBody(rawText) {
   let text = rawText || '';
 
-  // Drop quoted reply chains ("On <date>, X wrote:" and everything after)
+  // Drop quoted reply chains and everything after them
   text = text.split(/\r?\nOn .+wrote:\r?\n/i)[0];
   text = text.split(/\r?\n-{2,}\s*Original Message\s*-{2,}/i)[0];
 
-  // Drop lines that are pure quote markers
+  // Drop quote-marker lines ("> ...")
   text = text
     .split(/\r?\n/)
     .filter((line) => !line.trim().startsWith('>'))
     .join('\n');
 
-  // Drop common signature blocks
+  // Drop signatures
   text = text.split(/\r?\n--\s*\r?\n/)[0];
   text = text.split(/\r?\n(Sent from my|Regards,|Thanks,|Best,|Kind regards,)/i)[0];
 
-  return text.trim().slice(0, 6000); // hard cap — extremely long mails still get truncated before Claude sees them
+  return text.trim().slice(0, 6000);
 }
 
-function localUrgencyHint(cleanedText) {
-  const lower = cleanedText.toLowerCase();
+// ── 3. Simple keyword rules (edit these lists to tune the results) ──────
+const URGENT_KEYWORDS = ['urgent', 'asap', 'immediately', 'down', 'outage', 'critical', 'not working', 'blocked', 'production'];
+
+const NEGATIVE_WORDS = ['angry', 'worst', 'terrible', 'unacceptable', 'disappointed', 'complaint', 'frustrated', 'fed up', 'ridiculous', 'still not'];
+const POSITIVE_WORDS = ['thank', 'thanks', 'great', 'appreciate', 'happy', 'excellent'];
+
+const CATEGORY_RULES = [
+  ['Billing',         ['invoice', 'billing', 'payment', 'charged', 'charge']],
+  ['Refund',          ['refund', 'money back', 'cancel order']],
+  ['Account Access',  ['password', 'login', 'log in', 'sign in', 'locked', 'otp', 'access']],
+  ['Technical Issue', ['error', 'bug', 'crash', 'not working', 'down', 'outage', 'failed', 'issue']],
+  ['Feature Request', ['feature', 'suggest', 'would be nice', 'request to add']],
+];
+
+function localUrgency(text) {
+  const lower = text.toLowerCase();
   const hits = URGENT_KEYWORDS.filter((k) => lower.includes(k)).length;
-  const bangs = (cleanedText.match(/!!+/g) || []).length;
+  const bangs = (text.match(/!!+/g) || []).length;
   if (hits >= 2 || bangs > 0) return 'HIGH';
   if (hits === 1) return 'MEDIUM';
   return 'LOW';
 }
 
-function extractHeaderCustomer(fromHeader) {
+function guessSentiment(text, urgency) {
+  const lower = text.toLowerCase();
+  const negative = NEGATIVE_WORDS.some((w) => lower.includes(w));
+  if (negative && urgency === 'HIGH') return 'FRUSTRATED';
+  if (negative) return 'NEGATIVE';
+  if (POSITIVE_WORDS.some((w) => lower.includes(w))) return 'POSITIVE';
+  return 'NEUTRAL';
+}
+
+function guessCategory(text) {
+  const lower = text.toLowerCase();
+  for (const [category, words] of CATEGORY_RULES) {
+    if (words.some((w) => lower.includes(w))) return category;
+  }
+  return 'General Inquiry';
+}
+
+function cleanSubject(subjectHeader) {
+  const s = (subjectHeader || '').replace(/^(\s*(re|fwd?)\s*:\s*)+/i, '').trim();
+  return (s || 'New support ticket').slice(0, 120);
+}
+
+function parseSender(fromHeader) {
   // "Jane Doe <jane@acme.com>" -> { name: "Jane Doe", email: "jane@acme.com" }
   const match = /^(.*?)\s*<(.+?)>$/.exec((fromHeader || '').trim());
   if (match) return { name: match[1].replace(/"/g, '').trim() || null, email: match[2].trim() };
@@ -104,90 +112,30 @@ function extractHeaderCustomer(fromHeader) {
   return { name: null, email: emailOnly ? emailOnly[0] : null };
 }
 
-// ── Layer 2: Claude structured extraction ───────────────────────────────
-const SYSTEM_PROMPT = `You extract structured support-ticket fields from a customer email body, and decide whether this email is actually a genuine customer support request.
-Return ONLY a JSON object, no prose, no markdown fences, matching exactly this shape:
-{
-  "isSupportRequest": boolean, // true ONLY if this is a genuine query, complaint, or request from a customer that needs a human support response. false for: automated notifications, bounce/delivery-failure messages, out-of-office or auto-reply messages, newsletters, marketing/spam, calendar invites, or any other non-human-authored or non-support content — even if it mentions the company or a ticket number.
-  "subject": string,          // concise ticket title, <= 12 words, written by you (do not just copy the email subject verbatim if it's vague, e.g. "Re: Re: Hi")
-  "description": string,      // 2-4 sentence neutral summary of the customer's issue/request, in your own words
-  "customerName": string|null,
-  "productOrCategory": string, // best-guess category, e.g. "Billing", "Technical Issue", "Account Access", "Feature Request", "General Inquiry", "Refund"
-  "urgency": "LOW"|"MEDIUM"|"HIGH",
-  "sentiment": "POSITIVE"|"NEUTRAL"|"NEGATIVE"|"FRUSTRATED"
-}
-When isSupportRequest is false, still fill the other fields as best you can (a short neutral description of what the email actually is) — the caller uses isSupportRequest alone to decide whether to act on it.
-Base urgency and sentiment on the actual tone/content, not just keywords.`;
-
-async function extractTicketFields({ subjectHeader, cleanedBody, urgencyHint, isLong }) {
-  const model = isLong ? MODEL_ESCALATED : MODEL_DEFAULT;
-
-  const response = await anthropic.messages.create({
-    model,
-    max_tokens: 500,
-    system: SYSTEM_PROMPT,
-    messages: [
-      {
-        role: 'user',
-        content: `Email subject header: ${subjectHeader || '(none)'}\nLocal urgency pre-flag (you may override): ${urgencyHint}\n\nEmail body:\n${cleanedBody}`,
-      },
-    ],
-  });
-
-  const textBlock = response.content.find((b) => b.type === 'text');
-  const raw = (textBlock?.text || '{}').trim().replace(/^```(json)?/i, '').replace(/```$/, '').trim();
-
-  try {
-    return JSON.parse(raw);
-  } catch {
-    // Fail safe: never let a malformed model response crash ingestion —
-    // fall back to a minimal ticket the admin can fix by hand. Defaults
-    // to treating it as a real request, since silently dropping a
-    // genuine customer email on a parse failure is worse than creating
-    // one extra ticket to review.
-    return {
-      isSupportRequest: true,
-      subject: subjectHeader || 'New support ticket',
-      description: cleanedBody.slice(0, 300),
-      customerName: null,
-      productOrCategory: 'General Inquiry',
-      urgency: urgencyHint,
-      sentiment: 'NEUTRAL',
-    };
-  }
-}
-
-/** Full pipeline entry point used by mailIngest.js.
- *  Returns { skip: true, reason } for mail that shouldn't become a
- *  ticket at all, or the usual ticket fields object otherwise. */
+// ── Entry point used by mailIngest.js ───────────────────────────────────
+/** Returns { skip: true, reason } for mail that shouldn't become a ticket,
+ *  otherwise the ticket fields. Kept async so mailIngest.js needs no change
+ *  to how it calls this. */
 async function extractFromEmail({ fromHeader, subjectHeader, rawBody, receivedAt }) {
-  // Layer 1a — catch obvious system mail before spending any API call.
   if (isObviousSystemMail({ fromHeader, subjectHeader })) {
     return { skip: true, reason: 'system_generated_mail' };
   }
 
-  const cleaned = cleanBody(rawBody);
-  const urgencyHint = localUrgencyHint(cleaned);
-  const { name: headerName, email: senderEmail } = extractHeaderCustomer(fromHeader);
-  const isLong = cleaned.length > LONG_EMAIL_CHARS;
-
-  const fields = await extractTicketFields({ subjectHeader, cleanedBody: cleaned, urgencyHint, isLong });
-
-  // Layer 2 — Claude's judgment call on anything the header filter missed.
-  if (fields.isSupportRequest === false) {
-    return { skip: true, reason: 'not_a_support_request' };
-  }
+  const body = cleanBody(rawBody);
+  const { name, email } = parseSender(fromHeader);
+  const searchText = `${subjectHeader || ''}\n${body}`;
+  const urgency = localUrgency(searchText);
 
   return {
-    subject: fields.subject || subjectHeader || 'New support ticket',
-    description: fields.description || cleaned.slice(0, 300),
-    customerName: fields.customerName || headerName || senderEmail || 'Unknown',
-    customerEmail: senderEmail || 'unknown@unknown',
-    productOrCategory: fields.productOrCategory || 'General Inquiry',
-    urgency: ['LOW', 'MEDIUM', 'HIGH'].includes(fields.urgency) ? fields.urgency : urgencyHint,
-    sentiment: fields.sentiment || 'NEUTRAL',
+    subject: cleanSubject(subjectHeader),
+    description: body.slice(0, 500) || '(no message body)',
+    customerName: name || email || 'Unknown',
+    customerEmail: email || 'unknown@unknown',
+    productOrCategory: guessCategory(searchText),
+    urgency,
+    sentiment: guessSentiment(searchText, urgency),
     receivedAt: receivedAt || new Date().toISOString(),
   };
 }
 
-module.exports = { extractFromEmail, cleanBody, localUrgencyHint, isObviousSystemMail };
+module.exports = { extractFromEmail };

@@ -1,15 +1,23 @@
 import React, { createContext, useContext, useState } from 'react';
 
-
+/** Hierarchy: SUPER_ADMIN > SUPERVISOR > ZONAL_ADMIN > MANAGER > LEAD > CUSTOMER_SUPPORT */
+export type Role =
+  | 'SUPER_ADMIN'
+  | 'SUPERVISOR'
+  | 'ZONAL_ADMIN'
+  | 'MANAGER'
+  | 'LEAD'
+  | 'CUSTOMER_SUPPORT';
 
 export interface AuthUser {
   id: string;
   name: string;
   email: string;
-  role: 'SUPER_ADMIN' | 'SUPERVISOR' | 'ZONAL_ADMIN' | 'ZONAL_EXECUTIVE' | 'CUSTOMER_SUPPORT';
+  role: Role;
   zoneId?: number | null;
   zoneName?: string;
 }
+
 interface AuthCtx {
   user: AuthUser | null;
   token: string | null;
@@ -33,11 +41,22 @@ export function getInitials(user: Pick<AuthUser, 'name'>): string {
 export const STORAGE_KEY = 'mailMgmtAdminUser';
 export const TOKEN_KEY = 'mailMgmtAdminToken';
 
+const VALID_ROLES: Role[] = ['SUPER_ADMIN', 'SUPERVISOR', 'ZONAL_ADMIN', 'MANAGER', 'LEAD', 'CUSTOMER_SUPPORT'];
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
-      return raw ? JSON.parse(raw) : null;
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      // A session saved before the role change (e.g. ZONAL_EXECUTIVE) is no
+      // longer valid, so drop it and force a fresh login.
+      if (!VALID_ROLES.includes(parsed?.role)) {
+        localStorage.removeItem(STORAGE_KEY);
+        localStorage.removeItem(TOKEN_KEY);
+        return null;
+      }
+      return parsed;
     } catch {
       return null;
     }

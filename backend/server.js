@@ -17,9 +17,49 @@ const {
 const ticketsRepo = require('./ticketsRepo');
 const { testConnection } = require('./db');
 const { runIngestOnce } = require('./mailIngest');
-const { createTicketFromCall } = require('./callIngest');
+
 const { sendCommentEmail, sendCredentialsEmail, sendPasswordResetEmail } = require('./emailService');
- 
+
+// ── Role helpers ─────────────────────────────────────────────────────
+// Hierarchy: SUPER_ADMIN > SUPERVISOR > ZONAL_ADMIN > MANAGER > LEAD > CUSTOMER_SUPPORT
+
+// Roles allowed to assign tickets / view the support roster.
+const ASSIGNER_ROLES = ['LEAD', 'MANAGER', 'ZONAL_ADMIN', 'SUPERVISOR', 'SUPER_ADMIN'];
+
+// Roles that can see every zone (and filter by zone).
+const ALL_ZONE_ROLES = ['SUPER_ADMIN', 'SUPERVISOR'];
+
+/** Which Customer Support agents may this user assign tickets to?
+ *  Derived from the verified JWT — never from client input. */
+async function rosterFor(user, zoneIdFromQuery) {
+  switch (user.role) {
+    case 'LEAD':
+      return usersRepo.listCustomerSupportForLead(user.id); // own team only
+    case 'MANAGER':
+    case 'ZONAL_ADMIN':
+      if (!user.zoneId) return [];
+      return usersRepo.listCustomerSupportInZone(user.zoneId); // own zone only
+    default: // SUPER_ADMIN / SUPERVISOR
+      return zoneIdFromQuery
+        ? usersRepo.listCustomerSupportInZone(zoneIdFromQuery)
+        : usersRepo.listAllCustomerSupport();
+  }
+}
+
+/** Ticket-listing scope for each role (see ticketsRepo.listTickets). */
+function buildTicketScope(user) {
+  switch (user.role) {
+    case 'ZONAL_ADMIN':
+    case 'MANAGER':
+      return user.zoneId ? { zoneOrUnrouted: user.zoneId } : { none: true };
+    case 'LEAD':
+      return user.zoneId ? { leadId: user.id, zoneId: user.zoneId } : { none: true };
+    case 'CUSTOMER_SUPPORT':
+      return { assignedEngineerId: user.id };
+    default:
+      return null; // SUPER_ADMIN / SUPERVISOR → see all
+  }
+}
 
 // ── Domain: Auth (backed by Postgres users table — see usersRepo.js) ──
 
@@ -30,15 +70,14 @@ app.use(express.json());
 app.get('/api/zones', async (_req, res) => {
   res.json({ zones: await usersRepo.listZones() });
 });
- 
-// ── REPLACE the existing POST /api/auth/login route with this: ──────
+
 app.post('/api/auth/login', async (req, res) => {
   const { email, password, zoneId } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'email and password are required' });
   try {
     const user = await usersRepo.verifyLogin(email, password);
     if (!user) return res.status(401).json({ error: 'Invalid email or password' });
- 
+
     // Zone confirmation step — purely a UI check, not new security (the
     // backend already scopes every request by the account's real zoneId
     // regardless of what's selected here). Only applies to zone-scoped
@@ -51,15 +90,13 @@ app.post('/api/auth/login', async (req, res) => {
         return res.status(401).json({ error: 'Selected zone does not match this account.' });
       }
     }
- 
+
     const token = signToken(user);
     res.json({ token, user });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
-// ── Zones (for signup/assign dropdowns) ──────────────────────────────
 
 // ── List team members (scoped by the requester's role) ───────────────
 app.get('/api/users', requireAuth, async (req, res) => {
@@ -71,13 +108,12 @@ app.get('/api/users', requireAuth, async (req, res) => {
   }
 });
 
-
-// ── Customer Support roster for a zone (assignment dropdown) ─────────
-app.get('/api/customer-support', requireAuth, requireRole('ZONAL_EXECUTIVE', 'ZONAL_ADMIN', 'SUPERVISOR', 'SUPER_ADMIN'), async (req, res) => {
-  const zoneId = req.query.zoneId || req.user.zoneId;
-  if (!zoneId) return res.status(400).json({ error: 'zoneId is required' });
+// ── Customer Support roster (assignment dropdown) ────────────────────
+// LEAD -> their own team; MANAGER/ZONAL_ADMIN -> their zone;
+// SUPERVISOR/SUPER_ADMIN -> ?zoneId=… or everyone.
+app.get('/api/customer-support', requireAuth, requireRole(...ASSIGNER_ROLES), async (req, res) => {
   try {
-    const users = await usersRepo.listCustomerSupportInZone(zoneId);
+    const users = await rosterFor(req.user, req.query.zoneId);
     res.json({ users });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -85,59 +121,47 @@ app.get('/api/customer-support', requireAuth, requireRole('ZONAL_EXECUTIVE', 'ZO
 });
 
 // ── Assign / reassign a ticket to a Customer Support agent ──────────
-app.put('/api/tickets/:id/assign', requireAuth, requireRole('ZONAL_EXECUTIVE', 'ZONAL_ADMIN', 'SUPERVISOR', 'SUPER_ADMIN'), async (req, res) => {
+app.put('/api/tickets/:id/assign', requireAuth, requireRole(...ASSIGNER_ROLES), async (req, res) => {
   const { engineerId, engineerName } = req.body;
   if (!engineerId) return res.status(400).json({ error: 'engineerId is required' });
- 
+
   try {
-    // Zone-scoped roles can only hand a ticket to someone in their OWN
-    // zone's customer-support roster — checked server-side, not trusted
-    // from whatever the dropdown sent. SUPER_ADMIN/SUPERVISOR have no
-    // zone of their own and are allowed to assign to any zone, but we
-    // still verify the target really is an active Customer Support
-    // agent (not an arbitrary id) and capture their zone.
-    let targetAgentZoneId = null;
-    if (req.user.role === 'ZONAL_EXECUTIVE' || req.user.role === 'ZONAL_ADMIN') {
-      const roster = await usersRepo.listCustomerSupportInZone(req.user.zoneId);
-      const match = roster.find((u) => u.id === engineerId);
-      if (!match) {
-        return res.status(403).json({ error: 'That agent is not in your zone.' });
-      }
-      targetAgentZoneId = match.zoneId;
-    } else {
-      const allAgents = await usersRepo.listAllCustomerSupport();
-      const match = allAgents.find((u) => u.id === engineerId);
-      if (!match) {
-        return res.status(403).json({ error: 'That user is not an active Customer Support agent.' });
-      }
-      targetAgentZoneId = match.zoneId;
+    // The target must be in THIS user's allowed roster — checked
+    // server-side, not trusted from whatever the dropdown sent.
+    const roster = await rosterFor(req.user);
+    const match = roster.find((u) => u.id === engineerId);
+    if (!match) {
+      const msg =
+        req.user.role === 'LEAD'
+          ? 'That agent is not in your team.'
+          : req.user.role === 'MANAGER' || req.user.role === 'ZONAL_ADMIN'
+          ? 'That agent is not in your zone.'
+          : 'That user is not an active Customer Support agent.';
+      return res.status(403).json({ error: msg });
     }
- 
+
     const result = await ticketsRepo.assignEngineer(req.params.id, {
       engineerId,
       engineerName,
       assignedById: req.user.id,
       assignedByRole: req.user.role,
-      zoneId: targetAgentZoneId, // the AGENT's zone, not the assigner's
+      zoneId: match.zoneId, // the AGENT's zone, not the assigner's
     });
- 
+
     if (result.notFound) return res.status(404).json({ error: 'Ticket not found' });
     if (result.locked) {
       return res.status(409).json({
-        error: `This ticket was already assigned by a zonal executive and can't be reassigned.`,
+        error: `This ticket was already assigned by another lead and can't be reassigned by you.`,
       });
     }
- 
+
     res.json({ success: true, assignedEngineerId: engineerId, assignedEngineerName: engineerName || engineerId });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
- 
 
 // ── Generic Flowable REST proxy (same pattern as the audit app) ────────
-// Frontend can still call /flowable-api/* directly for anything not
-// covered by the domain routes below (e.g. raw workflow inspection).
 app.use('/flowable-api', async (req, res) => {
   const targetUrl = `${FLOWABLE_BASE}${req.path}`;
   const queryString = Object.keys(req.query).length ? '?' + new URLSearchParams(req.query).toString() : '';
@@ -172,6 +196,9 @@ app.get('/api/tickets/:id/history', requireAuth, async (req, res) => {
 function toTicketSummary(t) {
   return {
     id: t.processInstanceId,
+    ticketNumber: t.ticketNumber,
+    zoneId: t.zoneId || null,
+    zoneName: t.zoneName || null,
     createTime: t.createdAt,
     lastActivityAt: t.lastActivityAt,
     subject: t.subject,
@@ -187,22 +214,34 @@ function toTicketSummary(t) {
   };
 }
 
-/** GET /api/tickets — role-scoped list. SUPER_ADMIN / SUPERVISOR /
- *  ZONAL_ADMIN see everything; ZONAL_EXECUTIVE sees unassigned tickets
- *  plus their own zone's; CUSTOMER_SUPPORT sees only their own. */
+/** GET /api/stats/zones — ticket counts per zone and status.
+ *  Super Admin and Supervisor only. */
+app.get('/api/stats/zones', requireAuth, requireRole('SUPER_ADMIN', 'SUPERVISOR'), async (_req, res) => {
+  try {
+    res.json({ stats: await ticketsRepo.getZoneStats() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** GET /api/tickets — role-scoped list (see buildTicketScope above).
+ *  SUPER_ADMIN / SUPERVISOR see everything; ZONAL_ADMIN and MANAGER see
+ *  their own zone (plus not-yet-routed tickets); LEAD sees their zone's
+ *  unassigned pool plus their team's tickets; CUSTOMER_SUPPORT sees only
+ *  their own. */
 app.get('/api/tickets', requireAuth, async (req, res) => {
   try {
-    const { status } = req.query;
-    let scope = null;
+    const { status, zoneId } = req.query;
+    const scope = buildTicketScope(req.user);
 
-    if (req.user.role === 'ZONAL_EXECUTIVE') {
-      scope = { onlyUnassignedOrOwnZone: req.user.zoneId };
-    } else if (req.user.role === 'CUSTOMER_SUPPORT') {
-      scope = { assignedEngineerId: req.user.id };
-    }
-    // SUPER_ADMIN / SUPERVISOR / ZONAL_ADMIN → scope stays null → see all.
+    // Zone filter is only honoured for roles that can see every zone.
+    const canFilterByZone = ALL_ZONE_ROLES.includes(req.user.role);
 
-    const tickets = await ticketsRepo.listTickets({ status: status || undefined, scope });
+    const tickets = await ticketsRepo.listTickets({
+      status: status || undefined,
+      zoneId: canFilterByZone ? zoneId || undefined : undefined,
+      scope,
+    });
     res.json({ tickets: tickets.map(toTicketSummary) });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -210,9 +249,7 @@ app.get('/api/tickets', requireAuth, async (req, res) => {
 });
 
 /** GET /api/tickets/:id — id is the processInstanceId (kept as the public
- *  identifier so already-sent tracking links keep working). Ticket
- *  content + comments come from Postgres; the active task is still
- *  asked of Flowable, since that's workflow state. */
+ *  identifier so already-sent tracking links keep working). */
 app.get('/api/tickets/:id', requireAuth, async (req, res) => {
   try {
     const ticket = await ticketsRepo.getTicketByProcessInstanceId(req.params.id);
@@ -238,6 +275,7 @@ app.get('/api/tickets/:id', requireAuth, async (req, res) => {
         receivedAt: ticket.receivedAt,
         assignedEngineerId: ticket.assignedEngineerId,
         assignedEngineerName: ticket.assignedEngineerName,
+        assignedById: ticket.assignedById,  
         assignmentLocked: ticket.assignmentLocked,
       },
       comments,
@@ -262,6 +300,7 @@ app.get('/api/public/tickets/:id', async (req, res) => {
 
     res.json({
       id: req.params.id,
+      ticketNumber: ticket.ticketNumber, 
       subject: ticket.subject,
       description: ticket.description,
       productOrCategory: ticket.productOrCategory,
@@ -283,18 +322,19 @@ app.post('/api/tickets/:id/comments', requireAuth, async (req, res) => {
 
   let comment;
   try {
+    // Hidden from the customer by default. It only becomes visible on the
+    // tracking page once the email has really been sent (below).
     comment = await ticketsRepo.addComment(req.params.id, {
       authorId,
       authorName,
       role: 'admin',
       text: text.trim(),
+      visible: false,
     });
   } catch (err) {
     console.error('[comments] failed to append comment:', err.message);
     return res.status(500).json({ error: err.message || 'Could not add comment to this ticket.' });
   }
-
-  const comments = await ticketsRepo.getComments(req.params.id);
 
   let mailSent = false;
   let mailError = null;
@@ -302,7 +342,6 @@ app.post('/api/tickets/:id/comments', requireAuth, async (req, res) => {
   if (sendMail) {
     try {
       const ticket = await ticketsRepo.getTicketByProcessInstanceId(req.params.id);
-      console.log('[comments] sendMail requested for ticket', req.params.id, '— customerEmail:', ticket?.customerEmail);
 
       if (!ticket?.customerEmail) {
         mailError = 'This ticket has no customer email on file.';
@@ -310,7 +349,6 @@ app.post('/api/tickets/:id/comments', requireAuth, async (req, res) => {
       } else {
         const ticketUrl = `${process.env.FRONTEND_BASE || 'http://localhost:5173'}/track/${req.params.id}`;
 
-        console.log('[comments] sending comment email to', ticket.customerEmail);
         const info = await sendCommentEmail({
           to: ticket.customerEmail,
           customerName: ticket.customerName,
@@ -321,6 +359,10 @@ app.post('/api/tickets/:id/comments', requireAuth, async (req, res) => {
         });
         console.log('[comments] ✅ comment email sent, messageId:', info?.messageId);
         mailSent = true;
+
+        // Emailed to the customer, so it now shows on their tracking page too.
+        await ticketsRepo.setCommentVisibility(comment.id, true);
+
         await ticketsRepo.logNotification(req.params.id, {
           type: 'COMMENT',
           toEmail: ticket.customerEmail,
@@ -342,6 +384,7 @@ app.post('/api/tickets/:id/comments', requireAuth, async (req, res) => {
     }
   }
 
+  const comments = await ticketsRepo.getComments(req.params.id);
   res.json({ comments, mailSent, mailError });
 });
 
@@ -359,9 +402,9 @@ app.put('/api/tickets/:id/comments/:commentId/visibility', requireAuth, async (r
   }
 });
 
-/** PUT /api/tickets/:id/status — { status: 'OPEN'|'IN_PROGRESS'|'RESOLVED'|'CLOSED', assignee? }
- *  Status lives in Postgres now (source of truth for listing/search) and
- *  is mirrored onto the Flowable process variable so the BPMN gateway and
+/** PUT /api/tickets/:id/status — { status: 'OPEN'|'IN_PROGRESS'|'RESOLVED'|'CLOSED' }
+ *  Status lives in Postgres (source of truth for listing/search) and is
+ *  mirrored onto the Flowable process variable so the BPMN gateway and
  *  task list stay consistent. The task is never completed here, so a
  *  ticket can always be reopened later. */
 app.put('/api/tickets/:id/status', requireAuth, async (req, res) => {
@@ -373,8 +416,6 @@ app.put('/api/tickets/:id/status', requireAuth, async (req, res) => {
     const task = await getActiveTaskForInstance(req.params.id);
     if (!task) return res.status(400).json({ error: 'No active task found for this ticket.' });
 
-    // Flowable no longer owns identity — no more claimTask() sync here.
-    // Who made the change is recorded from the verified JWT instead.
     const updated = await ticketsRepo.updateTicketStatus(req.params.id, status, req.user.id);
     if (!updated) return res.status(404).json({ error: 'Ticket not found' });
 
@@ -385,6 +426,7 @@ app.put('/api/tickets/:id/status', requireAuth, async (req, res) => {
     res.status(500).json({ error: err.response?.data || err.message });
   }
 });
+
 // ── Mail ingestion ───────────────────────────────────────────────────────
 
 /** POST /api/ingest/run — manual trigger (also useful for testing/demoing
@@ -422,31 +464,25 @@ cron.schedule(INGEST_CRON, () => {
 
 // ── Domain: Calls (CTI) ──────────────────────────────────────────────
 
-/** POST /api/calls/inbound — called by the CTI Adapter (softphone's
- *  onInvite handler) the moment a call rings in. This does NOT create a
- *  ticket yet — it just lets the frontend know a call is live so the
- *  Agent Extension screen can pop with caller info pre-filled (BR-20).
- *  Ticket creation happens only when the rep submits the form, via the
- *  route below (BR-21). */
+/** POST /api/calls/inbound — called by the CTI Adapter the moment a call
+ *  rings in. Does NOT create a ticket yet; it just lets the frontend know
+ *  a call is live (BR-20). */
 app.post('/api/calls/inbound', async (req, res) => {
   const { callId, callerNumber, agentId } = req.body;
   if (!callerNumber) return res.status(400).json({ error: 'callerNumber is required' });
   res.json({ received: true, callId, callerNumber, agentId });
 });
 
-/** POST /api/calls/:callId/create-ticket — rep submits the screen-pop form
- *  while on the call (BR-21). Starts callTicketWorkflow (see
- *  callIngest.js), deduped by callId so a retried request never creates a
- *  second ticket for the same call (BR-23). */
-app.post('/api/calls/:callId/create-ticket', async (req, res) => {
-  try {
-    const result = await createTicketFromCall({ callId: req.params.callId, ...req.body });
-    res.json({ success: true, ...result });
-  } catch (err) {
-    res.status(500).json({ error: err.response?.data || err.message });
-  }
-});
+// app.post('/api/calls/:callId/create-ticket', async (req, res) => {
+//   try {
+//     const result = await createTicketFromCall({ callId: req.params.callId, ...req.body });
+//     res.json({ success: true, ...result });
+//   } catch (err) {
+//     res.status(500).json({ error: err.response?.data || err.message });
+//   }
+// });
 
+// ── Create a subordinate account (hierarchy enforced in usersRepo) ──────
 app.post('/api/users', requireAuth, async (req, res) => {
   const { name, email, password, role, zoneId } = req.body;
   if (!name || !email || !password || !role) {
@@ -454,7 +490,7 @@ app.post('/api/users', requireAuth, async (req, res) => {
   }
   try {
     const created = await usersRepo.createSubordinate(req.user, { name, email, password, role, zoneId });
- 
+
     // Send the new account its login credentials. Failure here shouldn't
     // fail account creation — it's already logged inside emailService.
     const loginUrl = `${process.env.FRONTEND_BASE}/login`;
@@ -466,20 +502,20 @@ app.post('/api/users', requireAuth, async (req, res) => {
       role,
       loginUrl,
     });
- 
+
     res.json({ user: created });
   } catch (err) {
     res.status(403).json({ error: err.message });
   }
 });
- 
+
 /** POST /api/auth/forgot-password — { email }
  *  Always responds the same way whether or not the email exists, so the
  *  endpoint can't be used to check which emails have accounts. */
 app.post('/api/auth/forgot-password', async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: 'email is required' });
- 
+
   try {
     const result = await usersRepo.createPasswordResetToken(email);
     if (result) {
@@ -491,13 +527,13 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
- 
+
 /** POST /api/auth/reset-password — { token, newPassword } */
 app.post('/api/auth/reset-password', async (req, res) => {
   const { token, newPassword } = req.body;
   if (!token || !newPassword) return res.status(400).json({ error: 'token and newPassword are required' });
   if (newPassword.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters.' });
- 
+
   try {
     const result = await usersRepo.resetPasswordWithToken(token, newPassword);
     if (result.error) return res.status(400).json({ error: result.error });

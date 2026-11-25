@@ -34,11 +34,12 @@ export interface LoginResponse {
     name: string;
     email: string;
     role: string;
+    zoneId?: number | null;
+    zoneName?: string;
   };
   token: string;
 }
 
-// ── REPLACE the existing login() function with this ──────────────────
 export async function login(email: string, password: string, zoneId?: number): Promise<LoginResponse> {
   return apiFetch<LoginResponse>('/api/auth/login', {
     method: 'POST',
@@ -46,11 +47,20 @@ export async function login(email: string, password: string, zoneId?: number): P
   });
 }
 
+/** Every active Customer Support agent (Super Admin / Supervisor only). */
 export async function getAllCustomerSupport(): Promise<TeamUser[]> {
   const data = await apiFetch<{ users: TeamUser[] }>('/api/customer-support/all');
   return data.users;
 }
- 
+
+/** The agents the logged-in user may assign tickets to. The backend decides
+ *  the list from the verified token:
+ *    LEAD -> own team · MANAGER / ZONAL_ADMIN -> own zone. */
+export async function getMyAssignableAgents(): Promise<TeamUser[]> {
+  const data = await apiFetch<{ users: TeamUser[] }>('/api/customer-support');
+  return data.users;
+}
+
 // ---- Team management ----
 
 export interface TeamUser {
@@ -60,6 +70,8 @@ export interface TeamUser {
   role: string;
   zoneId?: number;
   zoneName?: string;
+  active?: boolean;
+  createdAt?: string;
 }
 
 export interface Zone {
@@ -81,19 +93,14 @@ export interface CreateTeamMemberInput {
   zoneId?: number;
 }
 
-export async function createTeamMember(input: {
-  name: string;
-  email: string;
-  password: string;
-  role: string;
-  zoneId?: number;
-}): Promise<TeamUser> {
+export async function createTeamMember(input: CreateTeamMemberInput): Promise<TeamUser> {
   const data = await apiFetch<{ user: TeamUser }>('/api/users', {
     method: 'POST',
     body: JSON.stringify(input),
   });
   return data.user;
 }
+
 export async function getZones(): Promise<Zone[]> {
   const data = await apiFetch<{ zones: Zone[] }>('/api/zones');
   return data.zones;
@@ -113,6 +120,11 @@ export async function getTicketHistory(id: string): Promise<StatusHistoryEntry[]
 
 export interface TicketSummary {
   id: string; // processInstanceId — stable for the ticket's whole lifecycle
+  ticketNumber?: number;
+  zoneId?: number | null;
+  zoneName?: string | null;
+  assignedEngineerId?: string | null;
+  assignedEngineerName?: string | null;
   createTime: string;
   subject: string;
   description: string;
@@ -122,6 +134,7 @@ export interface TicketSummary {
   urgency: 'LOW' | 'MEDIUM' | 'HIGH';
   sentiment: 'POSITIVE' | 'NEUTRAL' | 'NEGATIVE' | 'FRUSTRATED';
   receivedAt: string;
+   lastActivityAt?: string;  
   ticketStatus: string;
   closed: boolean;
 }
@@ -148,9 +161,9 @@ export interface TicketVariables {
   receivedAt: string;
   assignedEngineerId?: string;
   assignedEngineerName?: string;
+  assignedById?: string; // who made the current assignment (lets a Lead know it's theirs)
   // Anything not listed above (like assignmentLocked, which the backend
-  // sends as a real boolean, not a string) falls through to this looser
-  // type — keeps the named fields strict while still allowing that one.
+  // sends as a real boolean, not a string) falls through to this looser type.
   [key: string]: string | boolean | undefined;
 }
 
@@ -161,15 +174,36 @@ export interface TicketDetail {
   comments: CommentEntry[];
 }
 
-export async function getTickets(): Promise<TicketSummary[]> {
-  const data = await apiFetch<{ tickets: TicketSummary[] }>('/api/tickets');
+/** zoneId: a zone id, or 'none' for tickets not yet in any zone.
+ *  Only Super Admin / Supervisor can filter by zone. */
+export async function getTickets(opts: { zoneId?: number | string; status?: string } = {}): Promise<TicketSummary[]> {
+  const qs = new URLSearchParams();
+  if (opts.zoneId !== undefined && opts.zoneId !== '') qs.set('zoneId', String(opts.zoneId));
+  if (opts.status) qs.set('status', opts.status);
+  const q = qs.toString();
+  const data = await apiFetch<{ tickets: TicketSummary[] }>(`/api/tickets${q ? `?${q}` : ''}`);
   return data.tickets;
+}
+
+export interface ZoneStat {
+  zoneId: number | null;
+  zoneName: string;
+  status: string;
+  count: number;
+}
+
+/** Ticket counts per zone and status (Super Admin / Supervisor only). */
+export async function getZoneStats(): Promise<ZoneStat[]> {
+  const data = await apiFetch<{ stats: ZoneStat[] }>('/api/stats/zones');
+  return data.stats;
 }
 
 export async function getTicket(id: string): Promise<TicketDetail> {
   return apiFetch<TicketDetail>(`/api/tickets/${id}`);
 }
 
+/** Still works (Super Admin / Supervisor can pass a zone); other roles'
+ *  rosters are decided by the backend regardless of the zoneId sent. */
 export async function getCustomerSupportForZone(zoneId: number): Promise<TeamUser[]> {
   const data = await apiFetch<{ users: TeamUser[] }>(`/api/customer-support?zoneId=${zoneId}`);
   return data.users;
@@ -245,8 +279,6 @@ export async function createTicketFromCall(
     body: JSON.stringify(data),
   });
 }
-
-// ── ADD these two functions to ticketApi.ts ──────────────────────────
 
 export async function forgotPassword(email: string): Promise<{ success: boolean; message: string }> {
   return apiFetch('/api/auth/forgot-password', {
