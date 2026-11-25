@@ -56,7 +56,7 @@ cd frontend
 npm install
 npm run dev
 ```
-Runs on Vite's default port (5173) and proxies `/api` + `/flowable-api` to the
+Runs on Vite's default port (5174) and proxies `/api` + `/flowable-api` to the
 backend on 4000 (see `vite.config.ts`) — no `VITE_API_BASE` needed in dev.
 
 Sign in with any name/email (this is a placeholder local admin identity used to
@@ -95,7 +95,6 @@ up real auth before production).
 node seedSuperAdmin.js "Admin" admin2@test.com "Admin@12345"
 
 
-can createthe ticket on hishown on behl od customer,
-
-
-updated to not creta te ticket for mail unasgned 
+donot show creat ethe cs, lead just sjow teh add member the n drop down 
+mail is takingtume tio get creat teh ticket 
+lead cannot geeratetehg cs canoinly assign teh ticket 

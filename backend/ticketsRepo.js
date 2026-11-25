@@ -32,6 +32,9 @@ function ticketRowToObject(row) {
     assignedEngineerId: row.assigned_engineer_id,
     assignedEngineerName: row.assigned_engineer_name,
     assignedByRole: row.assigned_by_role,
+        createdById: row.created_by_id,
+    createdByRole: row.created_by_role,
+    ownerLeadId: row.owner_lead_id,
     assignedById: row.assigned_by_id,
     zoneId: row.zone_id,
     zoneName: row.zone_name || null,
@@ -90,6 +93,10 @@ async function createTicket(fields) {
     urgency,
     sentiment,
     receivedAt,
+    zoneId = null,
+    createdById = null,
+    createdByRole = null,
+    ownerLeadId = null,
     callId = null,
     callerNumber = null,
     agentId = null,
@@ -105,8 +112,9 @@ async function createTicket(fields) {
          subject, description, customer_name, customer_email,
          product_or_category, urgency, sentiment, ticket_status,
          received_at, call_id, caller_number, agent_id,
-         call_answered_at, call_ended_at, call_duration_seconds
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'OPEN',$12,$13,$14,$15,$16,$17,$18)
+         call_answered_at, call_ended_at, call_duration_seconds, zone_id,
+         created_by_id, created_by_role, owner_lead_id
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'OPEN',$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
        RETURNING *`,
       [
         ticketNumber, processInstanceId, source, businessKey,
@@ -114,12 +122,13 @@ async function createTicket(fields) {
         productOrCategory, urgency, sentiment,
         receivedAt || new Date().toISOString(),
         callId, callerNumber, agentId, callAnsweredAt, callEndedAt, callDurationSeconds,
+        zoneId, createdById, createdByRole, ownerLeadId,
       ]
     );
     const ticket = rows[0];
     await client.query(
-      `INSERT INTO ticket_status_history (ticket_id, status, changed_by) VALUES ($1, 'OPEN', 'system')`,
-      [ticket.id]
+      `INSERT INTO ticket_status_history (ticket_id, status, changed_by) VALUES ($1, 'OPEN', $2)`,
+      [ticket.id, createdById || 'system']
     );
     return ticketRowToObject(ticket);
   });
@@ -168,6 +177,13 @@ async function getInstanceIdByTicketNumber(ticketNumber) {
  *                                         already in their own zone
  *    - { assignedEngineerId: id }       → CUSTOMER_SUPPORT: only their own
  */
+/** Listing with optional filters. `scope` comes from the verified JWT
+ *  (see buildTicketScope in server.js), never from client input:
+ *    null                         -> everything (SUPER_ADMIN, SUPERVISOR)
+ *    { none: true }               -> nothing (zone-scoped user with no zone)
+ *    { zoneOrUnrouted: zoneId }   -> ZONAL_ADMIN / MANAGER
+ *    { leadId, zoneId }           -> LEAD: own team's tickets + unassigned email pool
+ *    { agentId }                  -> CUSTOMER_SUPPORT: assigned to or created by them */
 async function listTickets({ status, scope, zoneId, limit = 500 } = {}) {
   const clauses = [];
   const params = [];
@@ -177,8 +193,6 @@ async function listTickets({ status, scope, zoneId, limit = 500 } = {}) {
     clauses.push(`t.ticket_status = $${params.length}`);
   }
 
-  // Zone filter used by Super Admin / Supervisor.
-  // zoneId = 'none' -> tickets not yet assigned to any zone.
   if (zoneId === 'none') {
     clauses.push(`t.zone_id IS NULL`);
   } else if (zoneId) {
@@ -186,12 +200,30 @@ async function listTickets({ status, scope, zoneId, limit = 500 } = {}) {
     clauses.push(`t.zone_id = $${params.length}`);
   }
 
-  if (scope?.onlyUnassignedOrOwnZone) {
-    params.push(scope.onlyUnassignedOrOwnZone);
-    clauses.push(`(t.assigned_engineer_id IS NULL OR t.zone_id = $${params.length})`);
-  } else if (scope?.assignedEngineerId) {
-    params.push(scope.assignedEngineerId);
-    clauses.push(`t.assigned_engineer_id = $${params.length}`);
+  if (scope?.none) {
+    clauses.push('FALSE');
+  } else if (scope?.zoneOrUnrouted) {
+    params.push(scope.zoneOrUnrouted);
+    clauses.push(`(t.zone_id IS NULL OR t.zone_id = $${params.length})`);
+  } else if (scope?.leadId) {
+    params.push(scope.zoneId);
+    const zi = params.length;
+    params.push(String(scope.leadId));
+    const li = params.length;
+    clauses.push(
+      `((t.zone_id IS NULL OR t.zone_id = $${zi})
+        AND (
+          t.owner_lead_id::text = $${li}::text
+          OR t.assigned_engineer_id::text IN (
+               SELECT u.id::text FROM users u WHERE u.created_by::text = $${li}::text)
+          OR (t.created_by_id IS NULL AND t.assigned_engineer_id IS NULL)
+        ))`
+    );
+  } else if (scope?.agentId) {
+    params.push(String(scope.agentId));
+    clauses.push(
+      `(t.assigned_engineer_id::text = $${params.length}::text OR t.created_by_id::text = $${params.length}::text)`
+    );
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -230,10 +262,19 @@ async function getZoneStats() {
  *  matches zero rows in that case, so there's no separate race-prone
  *  "check then update" step; the WHERE clause IS the enforcement.
  *  SUPER_ADMIN / SUPERVISOR / ZONAL_ADMIN bypass the lock (override). */
+/** Assigns (or reassigns) a ticket to a customer-support agent.
+ *
+ *  Lock rule: once assigned, the ticket is locked.
+ *    - SUPER_ADMIN / SUPERVISOR / ZONAL_ADMIN / MANAGER can always override.
+ *    - A LEAD can only (re)assign if the ticket is unlocked OR they made the
+ *      current assignment themselves (so they can't override another lead).
+ *  The WHERE clause IS the enforcement, so there's no race-prone
+ *  "check then update" step. */
 async function assignEngineer(processInstanceId, { engineerId, engineerName, assignedById, assignedByRole, zoneId }) {
-  // NEW — Zonal Executive can now reassign too
-const canOverride = ['SUPER_ADMIN', 'SUPERVISOR', 'ZONAL_ADMIN', 'ZONAL_EXECUTIVE'].includes(assignedByRole);
-  const lockClause = canOverride ? '' : 'AND assignment_locked = FALSE';
+  const overrideRoles = ['SUPER_ADMIN', 'SUPERVISOR', 'ZONAL_ADMIN', 'MANAGER'];
+  const lockClause = overrideRoles.includes(assignedByRole)
+    ? ''
+    : 'AND (assignment_locked = FALSE OR assigned_by_id::text = $3::text)';
 
   const { rows } = await query(
     `UPDATE tickets
@@ -250,8 +291,6 @@ const canOverride = ['SUPER_ADMIN', 'SUPERVISOR', 'ZONAL_ADMIN', 'ZONAL_EXECUTIV
   );
 
   if (!rows[0]) {
-    // Either the ticket doesn't exist, or it's locked and this caller
-    // can't override it — tell those apart for a clearer error upstream.
     const existing = await getTicketByProcessInstanceId(processInstanceId);
     if (!existing) return { notFound: true };
     if (existing.assignmentLocked) return { locked: true, ticket: existing };
@@ -260,7 +299,6 @@ const canOverride = ['SUPER_ADMIN', 'SUPERVISOR', 'ZONAL_ADMIN', 'ZONAL_EXECUTIV
 
   return { ticket: ticketRowToObject(rows[0]) };
 }
-
 async function updateTicketStatus(processInstanceId, status, changedBy = null) {
   return withTransaction(async (client) => {
     const { rows } = await client.query(
@@ -412,8 +450,49 @@ async function getNotificationLog(processInstanceId) {
   return rows;
 }
 
+/** The few fields needed to decide whether a user may touch a ticket. */
+/** The few fields needed to decide whether a user may touch a ticket. */
+async function getAccessInfo(processInstanceId) {
+  const { rows } = await query(
+    `SELECT t.zone_id, t.created_by_id, t.owner_lead_id, t.assigned_engineer_id,
+            (SELECT u.created_by FROM users u
+              WHERE u.id::text = t.assigned_engineer_id::text LIMIT 1) AS agent_lead_id
+       FROM tickets t
+      WHERE t.process_instance_id = $1`,
+    [processInstanceId]
+  );
+  return rows[0] || null;
+}
+
+/** Which of these email Message-IDs are already a ticket or part of a thread? */
+async function getKnownMessageIds(ids) {
+  if (!ids || !ids.length) return new Set();
+  const { rows } = await query(
+    `SELECT business_key AS id FROM tickets WHERE business_key = ANY($1::text[])
+     UNION
+     SELECT message_id AS id FROM ticket_thread_messages WHERE message_id = ANY($1::text[])`,
+    [ids]
+  );
+  return new Set(rows.map((r) => r.id));
+}
+/** Most recent ticket from this sender with this (Re:/Fwd:-stripped) subject, last 30 days. */
+async function findOpenTicketBySenderAndSubject(email, normalizedSubject) {
+  if (!email || !normalizedSubject) return null;
+  const { rows } = await query(
+    `SELECT process_instance_id FROM tickets
+      WHERE lower(customer_email) = lower($1)
+        AND lower(regexp_replace(subject, '^\\s*((re|fwd?|fw)\\s*:\\s*)+', '', 'i')) = $2
+        AND created_at > now() - interval '30 days'
+      ORDER BY created_at DESC LIMIT 1`,
+    [email, normalizedSubject]
+  );
+  return rows[0]?.process_instance_id || null;
+}
 module.exports = {
   getNextTicketNumber,
+  findOpenTicketBySenderAndSubject,
+  getKnownMessageIds,
+  getAccessInfo,
   createTicket,
   getTicketByProcessInstanceId,
   getTicketByNumber,

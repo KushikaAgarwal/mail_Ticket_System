@@ -52,8 +52,13 @@ export default function TicketTrack() {
           if (!r.ok) throw new Error('not found');
           return r.json();
         })
-        .then((d) => alive && (setT(d), setNotFound(false)))
-        .catch(() => alive && !t && setNotFound(true))
+        .then((d) => {
+          if (alive) {
+            setT(d);
+            setNotFound(false);
+          }
+        })
+        .catch(() => alive && setT((cur) => { if (!cur) setNotFound(true); return cur; }))
         .finally(() => alive && setLoading(false));
     load();
     const timer = setInterval(load, REFRESH_MS);
@@ -61,7 +66,6 @@ export default function TicketTrack() {
       alive = false;
       clearInterval(timer);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
   if (loading) return <div className="trk-page"><div className="trk-card trk-center">Loading your ticket…</div></div>;
@@ -100,7 +104,6 @@ export default function TicketTrack() {
 
         <h1 className="trk-subject">{t.subject}</h1>
 
-        {/* Progress tracker */}
         <div className="trk-steps">
           {STEPS.map((s, i) => (
             <div key={s} className={`trk-step${i <= idx ? ' done' : ''}${i === idx ? ' current' : ''}`}>

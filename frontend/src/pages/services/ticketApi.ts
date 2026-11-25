@@ -293,3 +293,22 @@ export async function resetPassword(token: string, newPassword: string): Promise
     body: JSON.stringify({ token, newPassword }),
   });
 }
+
+export interface NewTicketInput {
+  subject: string;
+  description: string;
+  customerName?: string;
+  customerEmail?: string;
+  productOrCategory?: string;
+  urgency: 'LOW' | 'MEDIUM' | 'HIGH';
+  zoneId?: number; // required for Super Admin / Supervisor only
+  notifyCustomer?: boolean;
+}
+
+export async function createTicket(input: NewTicketInput): Promise<{ id: string; ticketNumber: number }> {
+  const data = await apiFetch<{ ticket: { id: string; ticketNumber: number } }>('/api/tickets', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+  return data.ticket;
+}

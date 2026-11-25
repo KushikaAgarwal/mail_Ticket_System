@@ -33,12 +33,15 @@ export default function Sidebar() {
   return (
     <aside className="sidebar">
       <div className="brand">
-        <div className="brand-logo">PS</div>
-        <div>
-          <div className="brand-name">PS QuickIt</div>
-          <div className="brand-sub">Support desk</div>
-        </div>
-      </div>
+  <div className="brand-container">
+    <img
+      src="/image.png"
+      alt="PS QuickIT"
+      className="brand-image"
+    />
+    <div className="brand-sub">Support desk</div>
+  </div>
+</div>
 
       <div className="nav-section">Workspace</div>
       <NavLink to="/" end className={({ isActive }) => link(isActive)}>

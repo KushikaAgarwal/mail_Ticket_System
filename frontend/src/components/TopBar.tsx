@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { SearchIcon, PlusIcon, LogOutIcon } from 'lucide-react';
+import { SearchIcon, PlusIcon, LogOutIcon, TicketIcon } from 'lucide-react';
 import { useAuth } from '../pages/AuthContext';
 import { Avatar } from './ui';
 import NotificationBell from './NotificationBell';
@@ -13,6 +13,7 @@ interface TopbarProps {
 function crumbFor(pathname: string): string {
   if (pathname === '/') return 'Dashboard';
   if (pathname === '/tickets') return 'Tickets';
+  if (pathname === '/tickets/new') return 'New ticket';
   if (pathname.startsWith('/tickets/')) return 'Ticket';
   if (pathname === '/team') return 'Team';
   if (pathname === '/agent') return 'Agent Extension';
@@ -49,6 +50,11 @@ export default function Topbar({ pathname }: TopbarProps) {
       </form>
 
       <div className="top-actions">
+        {user && (
+          <button type="button" className="btn btn-outline" onClick={() => navigate('/tickets/new')}>
+            <TicketIcon size={14} /> New ticket
+          </button>
+        )}
         {creatable.length > 0 && (
           <button type="button" className="btn btn-primary" onClick={() => navigate('/team?new=1')}>
             <PlusIcon size={14} /> {createLabel}

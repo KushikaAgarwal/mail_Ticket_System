@@ -1,14 +1,26 @@
 const nodemailer = require("nodemailer");
+const { mailboxForZoneName } = require('./mailboxes');
 
-const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT),
-  secure: process.env.SMTP_SECURE === "true", // true for 465, false for 587
-  auth: {
-    user: process.env.EMAIL,
-    pass: process.env.EMAIL_APP_PASSWORD,
-  },
-});
+const transporters = new Map();
+
+/** One SMTP connection per mailbox, created on first use. */
+function transporterFor(mailbox) {
+  const m = mailbox || { email: process.env.EMAIL, password: process.env.EMAIL_APP_PASSWORD };
+  if (!transporters.has(m.email)) {
+    transporters.set(
+      m.email,
+      nodemailer.createTransport({
+        host: process.env.SMTP_HOST,
+        port: Number(process.env.SMTP_PORT),
+        secure: process.env.SMTP_SECURE === "true",
+        auth: { user: m.email, pass: m.password },
+      })
+    );
+  }
+  return transporters.get(m.email);
+}
+
+const generalTransporter = () => transporterFor(null);
 
 // ── Helpers for the customer-facing emails ───────────────────────────
 
@@ -46,10 +58,12 @@ function ticketButton(url) {
 
 // ── Customer emails ──────────────────────────────────────────────────
 
-async function sendAcknowledgementEmail({ to, customerName, subject, ticketId, ticketUrl, inReplyTo }) {
+/** `mailbox` is the mailbox the customer wrote to (so we reply from it). */
+async function sendAcknowledgementEmail({ to, customerName, subject, ticketId, ticketUrl, inReplyTo, mailbox }) {
   const key = ticketKey(ticketId);
-  return transporter.sendMail({
-    from: `"PS QuickIt Support" <${process.env.EMAIL}>`,
+  const from = mailbox || mailboxForZoneName(null);
+  return transporterFor(from).sendMail({
+    from: `"PS QuickIt Support" <${from.email}>`,
     to,
     subject: `[${key}] We’ve received your request`,
     html: emailShell(`
@@ -69,11 +83,13 @@ async function sendAcknowledgementEmail({ to, customerName, subject, ticketId, t
   });
 }
 
-async function sendCommentEmail({ to, customerName, subject, ticketId, ticketUrl, commentText, inReplyTo }) {
+/** `zoneName` picks the sending mailbox (the ticket's zone). */
+async function sendCommentEmail({ to, customerName, subject, ticketId, ticketUrl, commentText, inReplyTo, zoneName }) {
   const key = ticketKey(ticketId);
+  const from = mailboxForZoneName(zoneName);
   try {
-    return await transporter.sendMail({
-      from: `"PS QuickIt Support" <${process.env.EMAIL}>`,
+    return await transporterFor(from).sendMail({
+      from: `"PS QuickIt Support" <${from.email}>`,
       to,
       subject: `Re: [${key}] ${subject || 'Your support request'}`,
       html: emailShell(`
@@ -94,15 +110,14 @@ async function sendCommentEmail({ to, customerName, subject, ticketId, ticketUrl
   }
 }
 
-// ── Internal emails ──────────────────────────────────────────────────
+// ── Internal emails (general mailbox) ────────────────────────────────
 
-/** NO LONGER CALLED. mailIngest.js stopped using it because the alert was
- *  sent to the polled inbox and was re-ingested as a new ticket (loop).
- *  Kept only in case you later send alerts from a different address. */
+/** NO LONGER CALLED (it caused an ingest loop). Kept only for later use
+ *  from a sender that is not one of the polled mailboxes. */
 async function notifyZonalStaffOfNewTicket({ recipients, subject, ticketId, ticketAdminUrl, customerName }) {
   if (!recipients.length) return;
   try {
-    await transporter.sendMail({
+    await generalTransporter().sendMail({
       from: `"PS QuickIt Support" <${process.env.EMAIL}>`,
       to: process.env.EMAIL,
       bcc: recipients.map((r) => r.email),
@@ -124,7 +139,7 @@ async function notifyZonalStaffOfNewTicket({ recipients, subject, ticketId, tick
 
 async function sendCredentialsEmail({ to, name, email, password, role, loginUrl }) {
   try {
-    await transporter.sendMail({
+    await generalTransporter().sendMail({
       from: `"PS QuickIt Support" <${process.env.EMAIL}>`,
       to,
       subject: 'Your account has been created',
@@ -141,15 +156,12 @@ async function sendCredentialsEmail({ to, name, email, password, role, loginUrl 
     });
   } catch (err) {
     console.error('Failed to send credentials email', err);
-    // Not re-thrown — a failed notification shouldn't fail account creation.
   }
 }
 
-/** Sent when someone requests a password reset. Link contains a
- *  single-use, hashed-at-rest, time-limited token (see usersRepo.js). */
 async function sendPasswordResetEmail({ to, name, resetUrl }) {
   try {
-    await transporter.sendMail({
+    await generalTransporter().sendMail({
       from: `"PS QuickIt Support" <${process.env.EMAIL}>`,
       to,
       subject: 'Reset your PS QuickIt password',
