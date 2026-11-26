@@ -40,6 +40,7 @@ export interface LoginResponse {
   token: string;
 }
 
+
 export async function login(email: string, password: string, zoneId?: number): Promise<LoginResponse> {
   return apiFetch<LoginResponse>('/api/auth/login', {
     method: 'POST',
@@ -146,7 +147,10 @@ export interface CommentEntry {
   role?: string;
   text: string;
   timestamp?: string;
-  visible?: boolean; // undefined/true = visible to customer, false = hidden
+  visible?: boolean; 
+  attachments?: AttachmentInfo[];
+  mentions?: { id: string; name: string }[];
+
 }
 
 export interface TicketVariables {
@@ -172,7 +176,25 @@ export interface TicketDetail {
   taskId: string | null;
   variables: TicketVariables;
   comments: CommentEntry[];
+  attachments?: AttachmentInfo[];
 }
+
+
+export interface AttachmentInfo {
+  id: string;
+  filename: string;
+  contentType?: string | null;
+  sizeBytes?: number | null;
+}
+
+export interface MentionUser {
+  id: string;
+  name: string;
+  role: string;
+  zoneName?: string;
+}
+
+
 
 /** zoneId: a zone id, or 'none' for tickets not yet in any zone.
  *  Only Super Admin / Supervisor can filter by zone. */
@@ -218,16 +240,65 @@ export async function assignTicket(id: string, engineerId: string, engineerName:
 
 export async function addTicketComment(
   id: string,
-  authorId: string,
-  authorName: string,
   text: string,
-  sendMail: boolean
-): Promise<CommentEntry[]> {
-  const data = await apiFetch<{ comments: CommentEntry[] }>(`/api/tickets/${id}/comments`, {
+  sendMail: boolean,
+  files: File[] = [],
+  mentionIds: string[] = []
+): Promise<{ comments: CommentEntry[]; mailSent: boolean; mailError: string | null }> {
+  const form = new FormData();
+  form.append('text', text);
+  form.append('sendMail', String(sendMail));
+  form.append('mentions', JSON.stringify(mentionIds));
+  files.forEach((f) => form.append('files', f));
+
+  const token = localStorage.getItem(TOKEN_KEY);
+  const res = await fetch(`${API_BASE}/api/tickets/${id}/comments`, {
     method: 'POST',
-    body: JSON.stringify({ authorId, authorName, text, sendMail }),
+    headers: token ? { Authorization: `Bearer ${token}` } : {}, // no Content-Type: the browser sets the multipart boundary
+    body: form,
   });
-  return data.comments;
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(typeof err.error === 'string' ? err.error : 'Could not add the comment.');
+  }
+  return res.json();
+}
+
+export async function getMentionable(id: string): Promise<MentionUser[]> {
+  const data = await apiFetch<{ users: MentionUser[] }>(`/api/tickets/${id}/mentionable`);
+  return data.users;
+}
+
+export interface MentionItem {
+  commentId: string;
+  authorName: string;
+  text: string;
+  createdAt: string;
+  ticketId: string;
+  ticketNumber?: number;
+  subject: string;
+}
+
+export async function getMyMentions(): Promise<MentionItem[]> {
+  const data = await apiFetch<{ mentions: MentionItem[] }>('/api/mentions');
+  return data.mentions;
+}
+
+/** Downloads a file through the logged-in session, then saves it. */
+export async function downloadAttachment(ticketId: string, att: AttachmentInfo): Promise<void> {
+  const token = localStorage.getItem(TOKEN_KEY);
+  const res = await fetch(`${API_BASE}/api/tickets/${ticketId}/attachments/${att.id}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  });
+  if (!res.ok) throw new Error('Could not download the file.');
+  const url = URL.createObjectURL(await res.blob());
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = att.filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
 export async function setCommentVisibility(
@@ -305,10 +376,34 @@ export interface NewTicketInput {
   notifyCustomer?: boolean;
 }
 
-export async function createTicket(input: NewTicketInput): Promise<{ id: string; ticketNumber: number }> {
-  const data = await apiFetch<{ ticket: { id: string; ticketNumber: number } }>('/api/tickets', {
-    method: 'POST',
-    body: JSON.stringify(input),
+export async function createTicket(input: {
+  subject: string;
+  description: string;
+  customerName?: string;
+  customerEmail?: string;
+  productOrCategory?: string;
+  urgency?: string;
+  zoneId?: number;
+  notifyCustomer?: boolean;
+  files?: File[];
+}): Promise<{ id: string; ticketNumber: number; mailSent: boolean; failedFiles?: string[] }> {
+  const { files = [], ...fields } = input;
+  const form = new FormData();
+  Object.entries(fields).forEach(([k, v]) => {
+    if (v !== undefined && v !== null && v !== '') form.append(k, String(v));
   });
-  return data.ticket;
+  files.forEach((f) => form.append('files', f));
+
+  const token = localStorage.getItem(TOKEN_KEY);
+  const res = await fetch(`${API_BASE}/api/tickets`, {
+    method: 'POST',
+    headers: token ? { Authorization: `Bearer ${token}` } : {}, // no Content-Type: the browser sets the multipart boundary
+    body: form,
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(typeof err.error === 'string' ? err.error : 'Could not create the ticket.');
+  }
+  const data = await res.json();
+  return { ...data.ticket, mailSent: data.mailSent, failedFiles: data.failedFiles };
 }

@@ -1,8 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ArrowLeftIcon } from 'lucide-react';
+import { ArrowLeftIcon, PaperclipIcon } from 'lucide-react';
 import { useAuth } from './AuthContext';
 import { createTicket, getZones, Zone } from './services/ticketApi';
+import { PendingFiles } from '../components/AttachmentList';
+import { useFilePicker, MAX_FILES, MAX_FILE, MAX_TOTAL } from '../components/attachmentRules';
 
 const CATEGORIES = ['General Inquiry', 'Technical Issue', 'Card Issue', 'Billing', 'Complaint', 'Other'];
 
@@ -23,6 +25,7 @@ export default function NewTicket() {
   const [notify, setNotify] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const attach = useFilePicker();
 
   useEffect(() => {
     if (needsZonePick) getZones().then(setZones).catch(() => {});
@@ -51,7 +54,12 @@ export default function NewTicket() {
         urgency,
         zoneId: needsZonePick ? Number(zoneId) : undefined,
         notifyCustomer: notify,
+        files: attach.files,
       });
+      if (t.failedFiles && t.failedFiles.length > 0) {
+        window.alert(`Ticket created, but these files could not be saved: ${t.failedFiles.join(', ')}`);
+      }
+      attach.clear();
       navigate(`/tickets/${t.id}`);
     } catch (err) {
       setError((err as Error).message);
@@ -88,6 +96,27 @@ export default function NewTicket() {
             <div className="form-row nt-full">
               <label>Description</label>
               <textarea value={description} onChange={(e) => setDescription(e.target.value)} required rows={5} />
+            </div>
+
+            <div className="form-row nt-full">
+              <label>Attachments (optional)</label>
+              <input
+                ref={attach.inputRef}
+                type="file"
+                multiple
+                hidden
+                onChange={(e) => attach.add(e.target.files)}
+              />
+              <div>
+                <button type="button" className="btn btn-ghost" onClick={attach.openDialog} disabled={saving}>
+                  <PaperclipIcon size={14} /> Attach files
+                </button>
+                <span className="hint" style={{ marginLeft: 8 }}>
+                  Up to {MAX_FILES} files, {MAX_FILE / 1048576} MB each ({MAX_TOTAL / 1048576} MB total)
+                </span>
+              </div>
+              <PendingFiles files={attach.files} onRemove={attach.removeAt} />
+              {attach.error && <div className="alert alert-danger">{attach.error}</div>}
             </div>
 
             <div className="form-row">

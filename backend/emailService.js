@@ -84,7 +84,8 @@ async function sendAcknowledgementEmail({ to, customerName, subject, ticketId, t
 }
 
 /** `zoneName` picks the sending mailbox (the ticket's zone). */
-async function sendCommentEmail({ to, customerName, subject, ticketId, ticketUrl, commentText, inReplyTo, zoneName }) {
+/** `zoneName` picks the sending mailbox; `attachments` is [{ filename, path }]. */
+async function sendCommentEmail({ to, customerName, subject, ticketId, ticketUrl, commentText, inReplyTo, zoneName, attachments = [] }) {
   const key = ticketKey(ticketId);
   const from = mailboxForZoneName(zoneName);
   try {
@@ -98,14 +99,16 @@ async function sendCommentEmail({ to, customerName, subject, ticketId, ticketUrl
         <div style="background:#f4f7fb;border-left:3px solid #0c66e4;padding:12px 16px;border-radius:6px;margin:14px 0;">
           ${esc(commentText).replace(/\n/g, '<br/>')}
         </div>
+        ${attachments.length ? `<p style="color:#6b778c;font-size:13px;">Attached: ${attachments.map((a) => esc(a.filename)).join(', ')}</p>` : ''}
         ${ticketButton(ticketUrl)}
         <p style="margin-bottom:0;">Regards,<br/><strong>PS QuickIt Support Team</strong></p>
       `),
+      attachments: attachments.map((a) => ({ filename: a.filename, path: a.path })),
       inReplyTo: inReplyTo || undefined,
       references: inReplyTo || undefined,
     });
   } catch (err) {
-    console.error("Failed to send comment email", err);
+    console.error('Failed to send comment email', err);
     throw err;
   }
 }
@@ -177,8 +180,33 @@ async function sendPasswordResetEmail({ to, name, resetUrl }) {
   }
 }
 
+/** Internal mail to a teammate who was tagged in a comment. Never fails the comment. */
+async function sendMentionEmail({ to, name, byName, ticketId, subject, text, ticketAdminUrl }) {
+  try {
+    await generalTransporter().sendMail({
+      from: `"PS QuickIt Support" <${process.env.EMAIL}>`,
+      to,
+      subject: `${byName} mentioned you on ${ticketKey(ticketId)}`,
+      html: `
+        <div style="font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#172b4d;line-height:1.6;">
+          <p>Hi ${esc(name)},</p>
+          <p><strong>${esc(byName)}</strong> mentioned you on <strong>${ticketKey(ticketId)}</strong> (${esc(subject)}):</p>
+          <div style="background:#f4f7fb;border-left:3px solid #8270db;padding:12px 16px;border-radius:6px;margin:14px 0;">
+            ${esc(text).replace(/\n/g, '<br/>')}
+          </div>
+          <p><a href="${ticketAdminUrl}" style="background:#0c66e4;color:#fff;text-decoration:none;padding:10px 18px;border-radius:6px;font-weight:600;display:inline-block;">Open ticket</a></p>
+          <p style="color:#6b778c;font-size:12px;">This is an automated message. Please don’t reply to it.</p>
+        </div>
+      `,
+    });
+  } catch (err) {
+    console.error('Failed to send mention email', err);
+  }
+}
+
 module.exports = {
   sendAcknowledgementEmail,
+  sendMentionEmail,
   sendCommentEmail,
   notifyZonalStaffOfNewTicket,
   sendPasswordResetEmail,

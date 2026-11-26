@@ -1,7 +1,7 @@
 require('dotenv').config();
 const imaps = require('imap-simple');
 const { simpleParser } = require('mailparser');
-
+const { saveBuffer, isBlocked, INBOUND_MAX_BYTES } = require('./attachments');
 const ticketsRepo = require('./ticketsRepo');
 const usersRepo = require('./usersRepo');
 const { startTicketProcess, saveProcessVariable } = require('./flowableClient');
@@ -104,6 +104,40 @@ async function resolveExistingTicket(parsed) {
   return null; // genuinely new mail
 }
 
+/** Stores the customer's attachments. Small inline images (signature logos,
+ *  tracking pixels) and executables are skipped. */
+async function saveInboundAttachments(parsed, processInstanceId, { commentId = null, messageId }) {
+  let saved = 0;
+  for (const a of parsed.attachments || []) {
+    try {
+      const buf = a.content;
+      if (!buf || !buf.length) continue;
+      const ext = (a.contentType || '').split('/')[1] || 'bin';
+      const name = String(a.filename || `attachment.${ext}`).slice(0, 200);
+
+      const inline = a.related || (a.contentDisposition === 'inline' && a.cid);
+      if (inline && buf.length < 30 * 1024) continue;
+      if (isBlocked(name)) { console.warn(`[mailIngest] skipped blocked attachment "${name}"`); continue; }
+      if (buf.length > INBOUND_MAX_BYTES) { console.warn(`[mailIngest] skipped oversized attachment "${name}"`); continue; }
+
+      const rel = await saveBuffer(processInstanceId, name, buf);
+      await ticketsRepo.addAttachment(processInstanceId, {
+        filename: name,
+        contentType: a.contentType,
+        sizeBytes: buf.length,
+        storagePath: rel,
+        sourceMessageId: messageId,
+        commentId,
+        origin: 'customer',
+      });
+      saved++;
+    } catch (err) {
+      console.warn('[mailIngest] could not save an attachment:', err.message);
+    }
+  }
+  if (saved) console.log(`[mailIngest] saved ${saved} attachment(s) for ${processInstanceId}`);
+  return saved;
+}
 /** `mailbox` is where the mail arrived; `zoneId` is that mailbox's zone (or null). */
 async function processMessage(connection, message, mailbox, zoneId) {
   const all = message.parts.find((p) => p.which === '');
@@ -131,15 +165,18 @@ async function processMessage(connection, message, mailbox, zoneId) {
 
   if (existingTicketId) {
     const fromName = parsed.from?.value?.[0]?.name || parsed.from?.text || 'Customer';
-    const replyText = (extractReplyText(parsed) || parsed.text || '').trim() || '(no text in reply)';
+       const replyText =
+      (extractReplyText(parsed) || parsed.text || '').trim() ||
+      ((parsed.attachments || []).length ? '(sent an attachment)' : '(no text in reply)');
 
-    await ticketsRepo.addComment(existingTicketId, {
+    const comment = await ticketsRepo.addComment(existingTicketId, {
       authorId: null,
       authorName: fromName,
       role: 'customer',
       text: replyText,
       timestamp: parsed.date ? parsed.date.toISOString() : new Date().toISOString(),
     });
+    await saveInboundAttachments(parsed, existingTicketId, { commentId: comment.id, messageId });
     await ticketsRepo.addThreadMessageId(existingTicketId, messageId);
 
     // A customer reply on a finished ticket reopens it, so agents notice it.
@@ -200,7 +237,7 @@ async function processMessage(connection, message, mailbox, zoneId) {
     zoneId, // the zone of the mailbox this mail arrived at (null for the general mailbox)
   });
   await ticketsRepo.addThreadMessageId(instance.id, messageId);
-
+  await saveInboundAttachments(parsed, instance.id, { commentId: null, messageId });
   // Acknowledge from the SAME mailbox the customer wrote to.
   const ticketUrl = `${process.env.FRONTEND_BASE || 'http://localhost:5174'}/track/${instance.id}`;
   let info;
@@ -347,4 +384,4 @@ async function runIngestOnce() {
   }
 }
 
-module.exports = { runIngestOnce };
+module.exports = { runIngestOnce, saveInboundAttachments };

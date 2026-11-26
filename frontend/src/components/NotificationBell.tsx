@@ -2,38 +2,42 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { BellIcon } from 'lucide-react';
 import { useAuth } from '../pages/AuthContext';
-import { getTickets, TicketSummary } from '../pages/services/ticketApi';
+import { getTickets, getMyMentions, TicketSummary, MentionItem } from '../pages/services/ticketApi';
 import { ticketKey } from './ui';
 
 const POLL_MS = 60_000;
 const WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
-type Kind = 'high' | 'unassigned' | 'update';
+type Kind = 'mention' | 'high' | 'unassigned' | 'update';
 
 interface Item {
-  ticket: TicketSummary;
+  id: string;
+  ticketId: string;
   at: number;
   kind: Kind;
-}
-
-function kindOf(t: TicketSummary): Kind {
-  const active = t.ticketStatus === 'OPEN' || t.ticketStatus === 'IN_PROGRESS';
-  if (active && t.urgency === 'HIGH') return 'high';
-  if (active && !t.assignedEngineerId) return 'unassigned';
-  return 'update';
+  text: string;
 }
 
 const KIND_LABEL: Record<Kind, string> = {
+  mention: 'Mentioned you',
   high: 'High priority',
   unassigned: 'Needs assignment',
   update: 'Activity',
 };
 
 const KIND_COLOR: Record<Kind, string> = {
+  mention: '#8270db',
   high: '#c9372c',
   unassigned: '#e56910',
   update: '#0c66e4',
 };
+
+function ticketKind(t: TicketSummary): Kind {
+  const active = t.ticketStatus === 'OPEN' || t.ticketStatus === 'IN_PROGRESS';
+  if (active && t.urgency === 'HIGH') return 'high';
+  if (active && !t.assignedEngineerId) return 'unassigned';
+  return 'update';
+}
 
 function timeAgo(ms: number): string {
   const s = Math.max(1, Math.floor((Date.now() - ms) / 1000));
@@ -49,13 +53,13 @@ export default function NotificationBell() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const [tickets, setTickets] = useState<TicketSummary[]>([]);
+  const [mentions, setMentions] = useState<MentionItem[]>([]);
   const [open, setOpen] = useState(false);
   const [seenAt, setSeenAt] = useState<number>(0);
   const boxRef = useRef<HTMLDivElement>(null);
 
   const storageKey = user ? `qi_notif_seen_${user.id}` : '';
 
-  // Last time this user opened the bell (first visit: look back 24h).
   useEffect(() => {
     if (!storageKey) return;
     try {
@@ -68,6 +72,7 @@ export default function NotificationBell() {
 
   const load = useCallback(() => {
     getTickets().then(setTickets).catch(() => {});
+    getMyMentions().then(setMentions).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -77,7 +82,6 @@ export default function NotificationBell() {
     return () => clearInterval(id);
   }, [user, load]);
 
-  // Close on outside click.
   useEffect(() => {
     const onDown = (e: MouseEvent) => {
       if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
@@ -87,8 +91,22 @@ export default function NotificationBell() {
   }, []);
 
   const now = Date.now();
-  const items: Item[] = tickets
-    .map((t) => ({ ticket: t, at: new Date(t.lastActivityAt || t.receivedAt || t.createTime).getTime(), kind: kindOf(t) }))
+  const ticketItems: Item[] = tickets.map((t) => ({
+    id: `t-${t.id}`,
+    ticketId: t.id,
+    at: new Date(t.lastActivityAt || t.receivedAt || t.createTime).getTime(),
+    kind: ticketKind(t),
+    text: `${ticketKey(t.ticketNumber)} · ${t.subject}`,
+  }));
+  const mentionItems: Item[] = mentions.map((m) => ({
+    id: `m-${m.commentId}`,
+    ticketId: m.ticketId,
+    at: new Date(m.createdAt).getTime(),
+    kind: 'mention',
+    text: `${ticketKey(m.ticketNumber)} · ${m.authorName}: ${m.text}`,
+  }));
+
+  const items = [...mentionItems, ...ticketItems]
     .filter((i) => now - i.at <= WINDOW_MS)
     .sort((a, b) => b.at - a.at)
     .slice(0, 15);
@@ -136,14 +154,10 @@ export default function NotificationBell() {
           {(unassignedCount > 0 || highCount > 0) && (
             <div className="notif-summary">
               {unassignedCount > 0 && (
-                <span className="notif-pill" style={{ color: KIND_COLOR.unassigned }}>
-                  {unassignedCount} unassigned
-                </span>
+                <span className="notif-pill" style={{ color: KIND_COLOR.unassigned }}>{unassignedCount} unassigned</span>
               )}
               {highCount > 0 && (
-                <span className="notif-pill" style={{ color: KIND_COLOR.high }}>
-                  {highCount} high priority open
-                </span>
+                <span className="notif-pill" style={{ color: KIND_COLOR.high }}>{highCount} high priority open</span>
               )}
             </div>
           )}
@@ -152,11 +166,11 @@ export default function NotificationBell() {
             {items.length === 0 && <div className="notif-empty">You're all caught up.</div>}
             {items.map((i) => (
               <div
-                key={i.ticket.id}
+                key={i.id}
                 className={`notif-item${i.at > seenAt ? ' unread' : ''}`}
                 onClick={() => {
                   setOpen(false);
-                  navigate(`/tickets/${i.ticket.id}`);
+                  navigate(`/tickets/${i.ticketId}`);
                 }}
               >
                 <span className="notif-dot" style={{ background: KIND_COLOR[i.kind] }} />
@@ -165,9 +179,7 @@ export default function NotificationBell() {
                     <span style={{ color: KIND_COLOR[i.kind], fontWeight: 600 }}>{KIND_LABEL[i.kind]}</span>
                     <span className="notif-time">{timeAgo(i.at)}</span>
                   </div>
-                  <div className="notif-text">
-                    {ticketKey(i.ticket.ticketNumber)} · {i.ticket.subject}
-                  </div>
+                  <div className="notif-text">{i.text}</div>
                 </div>
               </div>
             ))}

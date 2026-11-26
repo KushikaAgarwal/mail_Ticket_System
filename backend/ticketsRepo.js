@@ -64,6 +64,22 @@ function commentRowToObject(row) {
   };
 }
 
+function attachmentRowToObject(row) {
+  if (!row) return null;
+  return {
+    id: String(row.id),
+    commentId: row.comment_id || null,
+    filename: row.filename,
+    contentType: row.content_type || null,
+    sizeBytes: row.size_bytes != null ? Number(row.size_bytes) : null,
+    origin: row.origin || 'customer',
+    storagePath: row.storage_path,
+    uploadedAt: row.uploaded_at,
+  };
+}
+
+/** What the browser is allowed to see (never the server path). */
+const slimAttachment = (a) => ({ id: a.id, filename: a.filename, contentType: a.contentType, sizeBytes: a.sizeBytes });
 // ── ticket numbers ───────────────────────────────────────────────────
 
 /** Reserves the next ticket number up front (needed before the ticket row
@@ -349,7 +365,25 @@ async function getComments(processInstanceId, { visibleOnly = false } = {}) {
       ORDER BY c.created_at ASC`,
     [processInstanceId]
   );
-  return rows.map(commentRowToObject);
+  const comments = rows.map(commentRowToObject);
+  if (!comments.length) return comments;
+
+  const ids = comments.map((c) => String(c.id));
+  const [att, men] = await Promise.all([
+    query(`SELECT * FROM ticket_attachments WHERE comment_id = ANY($1::text[]) ORDER BY uploaded_at ASC`, [ids]),
+    query(
+      `SELECT m.comment_id, u.id, u.name
+         FROM comment_mentions m JOIN users u ON u.id = m.user_id
+        WHERE m.comment_id = ANY($1::text[])`,
+      [ids]
+    ),
+  ]);
+
+  return comments.map((c) => ({
+    ...c,
+    attachments: att.rows.filter((a) => a.comment_id === String(c.id)).map((a) => slimAttachment(attachmentRowToObject(a))),
+    mentions: men.rows.filter((m) => m.comment_id === String(c.id)).map((m) => ({ id: m.id, name: m.name })),
+  }));
 }
 
 async function setCommentVisibility(commentId, visible) {
@@ -406,15 +440,22 @@ async function getStatusHistory(processInstanceId) {
 
 // ── attachments ──────────────────────────────────────────────────────
 
-async function addAttachment(processInstanceId, { filename, contentType, sizeBytes, storagePath, sourceMessageId }) {
+async function addAttachment(
+  processInstanceId,
+  { filename, contentType, sizeBytes, storagePath, sourceMessageId, commentId = null, origin = 'customer' }
+) {
   const { rows: t } = await query(`SELECT id FROM tickets WHERE process_instance_id = $1`, [processInstanceId]);
   if (!t[0]) throw new Error(`No ticket found for process instance ${processInstanceId}`);
   const { rows } = await query(
-    `INSERT INTO ticket_attachments (ticket_id, filename, content_type, size_bytes, storage_path, source_message_id)
-     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
-    [t[0].id, filename, contentType || null, sizeBytes || null, storagePath, sourceMessageId || null]
+    `INSERT INTO ticket_attachments
+       (ticket_id, filename, content_type, size_bytes, storage_path, source_message_id, comment_id, origin)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+    [
+      t[0].id, filename, contentType || null, sizeBytes || null, storagePath,
+      sourceMessageId || null, commentId != null ? String(commentId) : null, origin,
+    ]
   );
-  return rows[0];
+  return attachmentRowToObject(rows[0]);
 }
 
 async function getAttachments(processInstanceId) {
@@ -425,9 +466,68 @@ async function getAttachments(processInstanceId) {
       ORDER BY a.uploaded_at ASC`,
     [processInstanceId]
   );
-  return rows;
+  return rows.map(attachmentRowToObject);
 }
 
+/** Files that came with the customer's ORIGINAL mail (not tied to a comment). */
+async function getTicketAttachments(processInstanceId) {
+  const { rows } = await query(
+    `SELECT a.* FROM ticket_attachments a
+       JOIN tickets t ON t.id = a.ticket_id
+      WHERE t.process_instance_id = $1 AND a.comment_id IS NULL
+      ORDER BY a.uploaded_at ASC`,
+    [processInstanceId]
+  );
+  return rows.map((r) => slimAttachment(attachmentRowToObject(r)));
+}
+
+/** One attachment of one ticket. With publicOnly, only what the customer may see:
+ *  their own files, or files on a comment that is visible to them. */
+async function getAttachmentForTicket(processInstanceId, attachmentId, { publicOnly = false } = {}) {
+  const { rows } = await query(
+    `SELECT a.* FROM ticket_attachments a
+       JOIN tickets t ON t.id = a.ticket_id
+       LEFT JOIN ticket_comments c ON c.id::text = a.comment_id
+      WHERE t.process_instance_id = $1 AND a.id::text = $2
+        ${publicOnly ? `AND (a.origin = 'customer' OR c.visible = TRUE)` : ''}`,
+    [processInstanceId, String(attachmentId)]
+  );
+  return rows[0] ? attachmentRowToObject(rows[0]) : null;
+}
+
+// ── mentions ─────────────────────────────────────────────────────────
+
+async function addMentions(commentId, userIds) {
+  for (const uid of userIds) {
+    await query(
+      `INSERT INTO comment_mentions (comment_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [String(commentId), uid]
+    );
+  }
+}
+
+async function getMyMentions(userId, limit = 20) {
+  const { rows } = await query(
+    `SELECT m.created_at, c.id AS comment_id, c.author_name, left(c.text, 140) AS text,
+            t.process_instance_id, t.ticket_number, t.subject
+       FROM comment_mentions m
+       JOIN ticket_comments c ON c.id::text = m.comment_id
+       JOIN tickets t ON t.id = c.ticket_id
+      WHERE m.user_id = $1 AND m.created_at > now() - interval '7 days'
+      ORDER BY m.created_at DESC
+      LIMIT $2`,
+    [userId, limit]
+  );
+  return rows.map((r) => ({
+    commentId: String(r.comment_id),
+    authorName: r.author_name || 'Someone',
+    text: r.text,
+    createdAt: r.created_at,
+    ticketId: r.process_instance_id,
+    ticketNumber: r.ticket_number,
+    subject: r.subject,
+  }));
+}
 // ── notification log ────────────────────────────────────────────────
 
 async function logNotification(processInstanceId, { type, toEmail, messageId, success = true, errorMessage = null }) {
@@ -514,4 +614,8 @@ module.exports = {
   logNotification,
   getZoneStats,
   getNotificationLog,
+  getTicketAttachments, 
+  getAttachmentForTicket, 
+  addMentions, 
+  getMyMentions,
 };

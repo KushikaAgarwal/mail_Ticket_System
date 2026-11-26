@@ -8,10 +8,7 @@ const { signToken, requireAuth, requireRole } = require('./authMiddleware');
 const {
   FLOWABLE_BASE,
   FLOWABLE_AUTH,
-  FLOWABLE_USER,
-  FLOWABLE_PASS,
   getActiveTaskForInstance,
-  claimTask,
   saveProcessVariable,
   startTicketProcess,
 } = require('./flowableClient');
@@ -19,13 +16,24 @@ const {
 const ticketsRepo = require('./ticketsRepo');
 const { testConnection } = require('./db');
 const { runIngestOnce } = require('./mailIngest');
+const {
+  uploadFiles,
+  prepareFiles,
+  validateFiles,
+  persistFiles,
+  streamAttachment,
+} = require('./attachmentHelpers');
 
 const {
   sendAcknowledgementEmail,
   sendCommentEmail,
+  sendMentionEmail,
   sendCredentialsEmail,
   sendPasswordResetEmail,
 } = require('./emailService');
+
+const FRONTEND = () => process.env.FRONTEND_BASE || 'http://localhost:5174';
+const ADMIN_FRONTEND = () => process.env.ADMIN_FRONTEND_BASE || FRONTEND();
 
 // ── Role helpers ─────────────────────────────────────────────────────
 // Hierarchy: SUPER_ADMIN > SUPERVISOR > ZONAL_ADMIN > MANAGER > LEAD > CUSTOMER_SUPPORT
@@ -113,6 +121,95 @@ async function requireTicketAccess(req, res, next) {
     next();
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+}
+
+/** Active users (other than the requester) who are allowed to open this ticket. */
+async function mentionableFor(req) {
+  const info = await ticketsRepo.getAccessInfo(req.params.id);
+  if (!info) return [];
+  const users = await usersRepo.listActiveUsers();
+  return users.filter(
+    (u) =>
+      String(u.id) !== String(req.user.id) &&
+      canAccessTicket({ id: u.id, role: u.role, zoneId: u.zoneId }, info)
+  );
+}
+
+// ── Comment helpers ──────────────────────────────────────────────────
+
+function parseMentionIds(raw) {
+  try {
+    const v = typeof raw === 'string' ? JSON.parse(raw || '[]') : raw || [];
+    return Array.isArray(v) ? v.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Saves mentions and emails the tagged people. Returns how many were tagged. */
+async function notifyMentions(req, comment, text, mentionIds) {
+  if (!mentionIds.length) return 0;
+  try {
+    const allowed = await mentionableFor(req);
+    const mentioned = allowed.filter((u) => mentionIds.includes(String(u.id)));
+    if (!mentioned.length) return 0;
+
+    await ticketsRepo.addMentions(comment.id, mentioned.map((u) => u.id));
+    const ticket = await ticketsRepo.getTicketByProcessInstanceId(req.params.id);
+    const adminUrl = `${ADMIN_FRONTEND()}/tickets/${req.params.id}`;
+
+    // allSettled: one bad address must not stop the others.
+    await Promise.allSettled(
+      mentioned.map((u) =>
+        sendMentionEmail({
+          to: u.email,
+          name: u.name,
+          byName: req.user.name,
+          ticketId: ticket.ticketNumber,
+          subject: ticket.subject,
+          text,
+          ticketAdminUrl: adminUrl,
+        })
+      )
+    );
+    return mentioned.length;
+  } catch (err) {
+    console.error('[comments] mention handling failed:', err.message);
+    return 0;
+  }
+}
+
+/** Emails the comment (with its files) to the customer and makes it visible on the tracking page. */
+async function emailCommentToCustomer(ticketId, comment, savedFiles) {
+  try {
+    const ticket = await ticketsRepo.getTicketByProcessInstanceId(ticketId);
+    if (!ticket?.customerEmail) return { mailSent: false, mailError: 'This ticket has no customer email on file.' };
+
+    const info = await sendCommentEmail({
+      to: ticket.customerEmail,
+      customerName: ticket.customerName,
+      subject: ticket.subject,
+      ticketId: ticket.ticketNumber,
+      ticketUrl: `${FRONTEND()}/track/${ticketId}`,
+      commentText: comment.text,
+      zoneName: ticket.zoneName,
+      attachments: savedFiles,
+    });
+
+    await ticketsRepo.setCommentVisibility(comment.id, true);
+    await ticketsRepo.logNotification(ticketId, {
+      type: 'COMMENT',
+      toEmail: ticket.customerEmail,
+      messageId: info?.messageId,
+      success: true,
+    });
+    if (info?.messageId) await ticketsRepo.addThreadMessageId(ticketId, info.messageId);
+    return { mailSent: true, mailError: null };
+  } catch (err) {
+    console.error('[comments] failed to send comment email:', err.response?.data || err);
+    await ticketsRepo.logNotification(ticketId, { type: 'COMMENT', success: false, errorMessage: err.message });
+    return { mailSent: false, mailError: err.message };
   }
 }
 
@@ -212,6 +309,8 @@ app.put('/api/tickets/:id/assign', requireAuth, requireRole(...ASSIGNER_ROLES), 
 });
 
 // ── Generic Flowable REST proxy ──────────────────────────────────────
+// TODO(security): this has no auth. Add requireAuth + requireRole('SUPER_ADMIN')
+// once you've confirmed nothing in the frontend calls it without a token.
 app.use('/flowable-api', async (req, res) => {
   const targetUrl = `${FLOWABLE_BASE}${req.path}`;
   const queryString = Object.keys(req.query).length ? '?' + new URLSearchParams(req.query).toString() : '';
@@ -291,13 +390,20 @@ app.get('/api/tickets', requireAuth, async (req, res) => {
 });
 
 /** POST /api/tickets: ANY logged-in member can raise a ticket.
+ *  Accepts JSON or multipart/form-data (field "files" for attachments).
  *  The ticket is stamped with the creator's zone and team, which is what
  *  later restricts who may update it (see canAccessTicket). */
-app.post('/api/tickets', requireAuth, async (req, res) => {
-  const { subject, description, customerName, customerEmail, productOrCategory, urgency, zoneId, notifyCustomer } = req.body;
+app.post('/api/tickets', requireAuth, uploadFiles, async (req, res) => {
+  const { subject, description, customerName, customerEmail, productOrCategory, urgency, zoneId } = req.body;
+  // multipart sends every field as a string
+  const notify = req.body.notifyCustomer !== false && req.body.notifyCustomer !== 'false';
 
   if (!subject || !subject.trim()) return res.status(400).json({ error: 'Subject is required.' });
   if (!description || !description.trim()) return res.status(400).json({ error: 'Description is required.' });
+
+  const files = prepareFiles(req);
+  const fileError = validateFiles(files);
+  if (fileError) return res.status(400).json({ error: fileError });
 
   const email = (customerEmail || '').trim() || null;
   if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -360,11 +466,14 @@ app.post('/api/tickets', requireAuth, async (req, res) => {
       ownerLeadId,
     });
 
+    // Files attached to the ticket itself (commentId = null).
+    const { failed } = await persistFiles(instance.id, files, { origin: 'agent' });
+
     // Optional confirmation email to the customer. A failure never fails the ticket.
     let mailSent = false;
-    if (email && notifyCustomer !== false) {
+    if (email && notify) {
       try {
-        const ticketUrl = `${process.env.FRONTEND_BASE || 'http://localhost:5174'}/track/${instance.id}`;
+        const ticketUrl = `${FRONTEND()}/track/${instance.id}`;
         const info = await sendAcknowledgementEmail({
           to: email,
           customerName: name,
@@ -391,7 +500,7 @@ app.post('/api/tickets', requireAuth, async (req, res) => {
       }
     }
 
-    res.json({ ticket: { id: instance.id, ticketNumber }, mailSent });
+    res.json({ ticket: { id: instance.id, ticketNumber }, mailSent, failedFiles: failed });
   } catch (err) {
     console.error('[tickets] create failed:', err);
     res.status(500).json({ error: err.response?.data?.message || err.message });
@@ -404,9 +513,10 @@ app.get('/api/tickets/:id', requireAuth, requireTicketAccess, async (req, res) =
     const ticket = await ticketsRepo.getTicketByProcessInstanceId(req.params.id);
     if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
 
-    const [activeTask, comments] = await Promise.all([
+    const [activeTask, comments, attachments] = await Promise.all([
       getActiveTaskForInstance(req.params.id),
       ticketsRepo.getComments(req.params.id),
+      ticketsRepo.getTicketAttachments(req.params.id),
     ]);
 
     res.json({
@@ -428,6 +538,7 @@ app.get('/api/tickets/:id', requireAuth, requireTicketAccess, async (req, res) =
         assignmentLocked: ticket.assignmentLocked,
       },
       comments,
+      attachments,
     });
   } catch (err) {
     res.status(500).json({ error: err.response?.data || err.message });
@@ -440,9 +551,10 @@ app.get('/api/public/tickets/:id', async (req, res) => {
     const ticket = await ticketsRepo.getTicketByProcessInstanceId(req.params.id);
     if (!ticket) return res.status(404).json({ error: 'Ticket not found' });
 
-    const [comments, history] = await Promise.all([
+    const [comments, history, attachments] = await Promise.all([
       ticketsRepo.getComments(req.params.id, { visibleOnly: true }),
       ticketsRepo.getStatusHistory(req.params.id),
+      ticketsRepo.getTicketAttachments(req.params.id),
     ]);
 
     res.json({
@@ -455,83 +567,99 @@ app.get('/api/public/tickets/:id', async (req, res) => {
       sentiment: ticket.sentiment,
       status: ticket.ticketStatus || 'OPEN',
       receivedAt: ticket.receivedAt,
-      comments: comments.map((c) => ({ authorName: c.authorName || 'Support', text: c.text, timestamp: c.timestamp })),
+      attachments,
+      comments: comments.map((c) => ({
+        authorName: c.authorName || 'Support',
+        text: c.text,
+        timestamp: c.timestamp,
+        attachments: c.attachments || [],
+      })),
       history,
     });
-  } catch (err) {
+  } catch {
     res.status(404).json({ error: 'Ticket not found' });
   }
 });
 
-app.post('/api/tickets/:id/comments', requireAuth, requireTicketAccess, async (req, res) => {
-  const { authorId, authorName, text, sendMail } = req.body;
-  if (!text || !text.trim()) return res.status(400).json({ error: 'Comment text is required' });
+/** POST /api/tickets/:id/comments (multipart: text, sendMail, mentions, files) */
+app.post('/api/tickets/:id/comments', requireAuth, requireTicketAccess, uploadFiles, async (req, res) => {
+  const ticketId = req.params.id;
+  const files = prepareFiles(req);
+  const rawText = String(req.body.text || '').trim();
+  const sendMail = req.body.sendMail === true || req.body.sendMail === 'true';
+
+  if (!rawText && !files.length) return res.status(400).json({ error: 'Write a comment or attach a file.' });
+
+  // Validate BEFORE creating anything, so a rejected file never leaves an orphan comment.
+  const fileError = validateFiles(files);
+  if (fileError) return res.status(400).json({ error: fileError });
+
+  const text = rawText || `Attached ${files.length} file${files.length === 1 ? '' : 's'}`;
 
   let comment;
   try {
-    // Hidden from the customer by default; becomes visible only once the
-    // email has really been sent (below).
-    comment = await ticketsRepo.addComment(req.params.id, {
-      authorId,
-      authorName,
+    comment = await ticketsRepo.addComment(ticketId, {
+      authorId: req.user.id, // always from the verified login, never the request body
+      authorName: req.user.name,
       role: 'admin',
-      text: text.trim(),
-      visible: false,
+      text,
+      visible: false, // becomes visible to the customer only once the email is sent
     });
   } catch (err) {
     console.error('[comments] failed to append comment:', err.message);
     return res.status(500).json({ error: err.message || 'Could not add comment to this ticket.' });
   }
 
-  let mailSent = false;
-  let mailError = null;
+  const { saved, failed } = await persistFiles(ticketId, files, { commentId: comment.id, origin: 'agent' });
+  const mentioned = await notifyMentions(req, comment, text, parseMentionIds(req.body.mentions));
+  const { mailSent, mailError } = sendMail
+    ? await emailCommentToCustomer(ticketId, comment, saved)
+    : { mailSent: false, mailError: null };
 
-  if (sendMail) {
-    try {
-      const ticket = await ticketsRepo.getTicketByProcessInstanceId(req.params.id);
+  const comments = await ticketsRepo.getComments(ticketId);
+  res.json({ comments, mailSent, mailError, mentioned, failedFiles: failed });
+});
 
-      if (!ticket?.customerEmail) {
-        mailError = 'This ticket has no customer email on file.';
-        console.warn('[comments]', mailError);
-      } else {
-        const ticketUrl = `${process.env.FRONTEND_BASE || 'http://localhost:5174'}/track/${req.params.id}`;
-
-        const info = await sendCommentEmail({
-          to: ticket.customerEmail,
-          customerName: ticket.customerName,
-          subject: ticket.subject,
-          ticketId: ticket.ticketNumber,
-          ticketUrl,
-          commentText: comment.text,
-        });
-        console.log('[comments] ✅ comment email sent, messageId:', info?.messageId);
-        mailSent = true;
-
-        await ticketsRepo.setCommentVisibility(comment.id, true);
-
-        await ticketsRepo.logNotification(req.params.id, {
-          type: 'COMMENT',
-          toEmail: ticket.customerEmail,
-          messageId: info?.messageId,
-          success: true,
-        });
-        if (info?.messageId) {
-          await ticketsRepo.addThreadMessageId(req.params.id, info.messageId);
-        }
-      }
-    } catch (err) {
-      mailError = err.message;
-      console.error('[comments] ❌ failed to send comment email:', err.response?.data || err);
-      await ticketsRepo.logNotification(req.params.id, {
-        type: 'COMMENT',
-        success: false,
-        errorMessage: err.message,
-      });
-    }
+/** Who can be tagged on this ticket. */
+app.get('/api/tickets/:id/mentionable', requireAuth, requireTicketAccess, async (req, res) => {
+  try {
+    const list = await mentionableFor(req);
+    res.json({ users: list.map((u) => ({ id: u.id, name: u.name, role: u.role, zoneName: u.zoneName })) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
+});
 
-  const comments = await ticketsRepo.getComments(req.params.id);
-  res.json({ comments, mailSent, mailError });
+/** Agent download (same zone/team rule as the ticket itself). */
+app.get('/api/tickets/:id/attachments/:attId', requireAuth, requireTicketAccess, async (req, res) => {
+  try {
+    const att = await ticketsRepo.getAttachmentForTicket(req.params.id, req.params.attId);
+    if (!att) return res.status(404).json({ error: 'File not found' });
+    streamAttachment(res, att);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Customer download from the tracking page: only their own files, or files
+ *  on a comment that was emailed/shown to them. Hidden notes stay private. */
+app.get('/api/public/tickets/:id/attachments/:attId', async (req, res) => {
+  try {
+    const att = await ticketsRepo.getAttachmentForTicket(req.params.id, req.params.attId, { publicOnly: true });
+    if (!att) return res.status(404).json({ error: 'File not found' });
+    streamAttachment(res, att);
+  } catch {
+    res.status(404).json({ error: 'File not found' });
+  }
+});
+
+/** Recent comments that tag the logged-in user (feeds the bell). */
+app.get('/api/mentions', requireAuth, async (req, res) => {
+  try {
+    res.json({ mentions: await ticketsRepo.getMyMentions(req.user.id, 20) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 /** PUT /api/tickets/:id/comments/:commentId/visibility: { visible: boolean } */
@@ -571,7 +699,8 @@ app.put('/api/tickets/:id/status', requireAuth, requireTicketAccess, async (req,
 
 // ── Mail ingestion ───────────────────────────────────────────────────────
 
-/** POST /api/ingest/run: manual trigger for testing. */
+/** POST /api/ingest/run: manual trigger for testing.
+ *  TODO(security): unauthenticated. Add requireAuth + requireRole('SUPER_ADMIN'). */
 app.post('/api/ingest/run', async (_req, res) => {
   try {
     const results = await runIngestOnce();
@@ -582,7 +711,7 @@ app.post('/api/ingest/run', async (_req, res) => {
   }
 });
 
-app.get('/api/customer-support/all', requireAuth, requireRole('SUPER_ADMIN', 'SUPERVISOR'), async (req, res) => {
+app.get('/api/customer-support/all', requireAuth, requireRole('SUPER_ADMIN', 'SUPERVISOR'), async (_req, res) => {
   try {
     const users = await usersRepo.listAllCustomerSupport();
     res.json({ users });
@@ -596,7 +725,7 @@ const INGEST_CRON = process.env.INGEST_CRON || '*/2 * * * *';
 cron.schedule(INGEST_CRON, () => {
   runIngestOnce()
     .then((results) => {
-            const created = results.filter((r) => r && !r.skipped && !r.error && !r.followUp).length;
+      const created = results.filter((r) => r && !r.skipped && !r.error && !r.followUp).length;
       if (created) console.log(`[ingest] created ${created} ticket(s)`);
     })
     .catch((err) => console.error('[ingest] error:', err.message));
@@ -643,7 +772,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
   try {
     const result = await usersRepo.createPasswordResetToken(email);
     if (result) {
-      const resetUrl = `${process.env.FRONTEND_BASE || 'http://localhost:5174'}/reset-password/${result.rawToken}`;
+      const resetUrl = `${FRONTEND()}/reset-password/${result.rawToken}`;
       await sendPasswordResetEmail({ to: result.user.email, name: result.user.name, resetUrl });
     }
     res.json({ success: true, message: 'Reset link has been sent.' });

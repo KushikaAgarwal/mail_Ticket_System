@@ -98,3 +98,12 @@ node seedSuperAdmin.js "Admin" admin2@test.com "Admin@12345"
 donot show creat ethe cs, lead just sjow teh add member the n drop down 
 mail is takingtume tio get creat teh ticket 
 lead cannot geeratetehg cs canoinly assign teh ticket 
+
+
+
+notifiction if exceed teh assigned dae
+renve teh sentiment
+assignment part 
+
+
+update teh ui of ticket

@@ -243,9 +243,17 @@ async function listAllCustomerSupport() {
   );
   return rows.map(userRowToObject);
 }
-
+/** Every active user, used to work out who can be tagged on a ticket. */
+async function listActiveUsers() {
+  const { rows } = await query(
+    `SELECT u.*, z.name AS zone_name FROM users u LEFT JOIN zones z ON z.id = u.zone_id
+      WHERE u.active = TRUE ORDER BY u.name ASC`
+  );
+  return rows.map(userRowToObject);
+}
 module.exports = {
   listZones,
+  listActiveUsers,
   getUserByEmail,
   getUserById,
   verifyLogin,

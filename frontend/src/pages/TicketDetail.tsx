@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { ArrowLeftIcon } from 'lucide-react';
-
+import AttachmentList from '../components/AttachmentList';
 import { CommentThread } from '../components/CommentThread';
 import { STATUS_LABELS, statusBadgeClass, urgencyBadgeClass, sentimentBadgeClass, TICKET_STATUS } from '../constants/ticketStatus';
 import { useAuth } from './AuthContext';
@@ -13,10 +13,12 @@ import {
   setCommentVisibility,
   getMyAssignableAgents,
   getAllCustomerSupport,
+  getMentionable,          // ← add
   assignTicket,
   TicketDetail as TicketDetailType,
   StatusHistoryEntry,
   TeamUser,
+  MentionUser,             // ← add
 } from './services/ticketApi';
 
 // Who can assign tickets at all.
@@ -44,7 +46,12 @@ export default function TicketDetail() {
   const [assigning, setAssigning] = useState(false);
 
   const canAssign = !!user && ASSIGN_ROLES.includes(user.role);
+  const [mentionable, setMentionable] = useState<MentionUser[]>([]);
 
+  useEffect(() => {
+    if (!taskId) return;
+    getMentionable(taskId).then(setMentionable).catch(() => setMentionable([]));
+  }, [taskId]);
   const load = async () => {
     if (!taskId) return;
     setLoading(true);
@@ -79,10 +86,11 @@ export default function TicketDetail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.role, user?.id]);
 
-  const handleAddComment = async (text: string, sendMail: boolean) => {
+    const handleAddComment = async (text: string, sendMail: boolean, files: File[], mentionIds: string[]) => {
     if (!taskId) return;
-    const comments = await addTicketComment(taskId, user?.id || 'admin', user?.name || 'Admin', text, sendMail);
-    setDetail((d) => (d ? { ...d, comments } : d));
+    const r = await addTicketComment(taskId, text, sendMail, files, mentionIds);
+    setDetail((d) => (d ? { ...d, comments: r.comments } : d));
+    if (sendMail && r.mailError) return `Saved, but the email was not sent: ${r.mailError}`;
   };
 
   const handleToggleVisibility = async (commentId: string, visible: boolean) => {
@@ -161,10 +169,7 @@ export default function TicketDetail() {
               <div className="text-gray-400 text-xs uppercase mb-1">Urgency</div>
               <span className={`badge ${urgencyBadgeClass(v.urgency)}`}>{v.urgency}</span>
             </div>
-            <div>
-              <div className="text-gray-400 text-xs uppercase mb-1">Sentiment</div>
-              <span className={`badge ${sentimentBadgeClass(v.sentiment)}`}>{v.sentiment}</span>
-            </div>
+         
             <div>
               <div className="text-gray-400 text-xs uppercase mb-1">Received</div>
               <div className="text-gray-800">{v.receivedAt ? new Date(v.receivedAt).toLocaleString() : '—'}</div>
@@ -173,7 +178,12 @@ export default function TicketDetail() {
 
           <div className="text-gray-400 text-xs uppercase mb-1">Description (AI summary)</div>
           <p className="text-gray-700 whitespace-pre-wrap mb-4">{v.description}</p>
-
+          {detail.attachments && detail.attachments.length > 0 && (
+            <div className="mb-4">
+              <div className="text-gray-400 text-xs uppercase mb-1">Attachments</div>
+              <AttachmentList ticketId={taskId || ''} items={detail.attachments} />
+            </div>
+          )}
           <div className="flex items-center gap-2">
             <span className="text-sm text-gray-500">Update status:</span>
             {(['OPEN', 'IN_PROGRESS', 'RESOLVED', 'CLOSED'] as const).map((s) => (
@@ -244,6 +254,7 @@ export default function TicketDetail() {
               {customerComments.map((c, i) => (
                 <li key={i} className="text-sm border-l-2 border-blue-400 pl-3">
                   <div className="text-gray-800 whitespace-pre-wrap">{c.text}</div>
+                                    <AttachmentList ticketId={taskId || ''} items={c.attachments} />
                   <div className="text-gray-400 text-xs mt-1">
                     {c.authorName} · {c.timestamp ? new Date(c.timestamp).toLocaleString() : '—'}
                   </div>
@@ -256,8 +267,10 @@ export default function TicketDetail() {
 
       <div className="card">
         <div className="card-body">
-          <CommentThread
+                    <CommentThread
+            ticketId={taskId || ''}
             comments={adminComments}
+            mentionable={mentionable}
             onAdd={handleAddComment}
             onToggleVisibility={handleToggleVisibility}
             disabled={status === 'CLOSED'}

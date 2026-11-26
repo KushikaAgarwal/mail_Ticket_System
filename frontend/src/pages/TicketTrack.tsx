@@ -1,9 +1,12 @@
 import React, { useEffect, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { CheckIcon } from 'lucide-react';
+import { formatSize } from '../components/attachmentRules'; // adjust the relative path to where you put it
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:4000';
 const REFRESH_MS = 60_000;
+
+interface PubAttachment { id: string; filename: string; sizeBytes?: number | null }
 
 interface PublicTicket {
   id: string;
@@ -13,7 +16,8 @@ interface PublicTicket {
   productOrCategory: string;
   status: string;
   receivedAt: string;
-  comments: { authorName: string; text: string; timestamp?: string }[];
+  attachments?: PubAttachment[];
+  comments: { authorName: string; text: string; timestamp?: string; attachments?: PubAttachment[] }[];
   history: { status: string; time: string }[];
 }
 
@@ -37,6 +41,59 @@ const fmt = (iso?: string) =>
   iso
     ? new Date(iso).toLocaleString(undefined, { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' })
     : '—';
+
+function Shell({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="trk-root">
+      <div className="trk-bg" aria-hidden="true">
+        <i className="trk-stripe s1" />
+        <i className="trk-stripe s2" />
+        <i className="trk-stripe s3" />
+        <i className="trk-stripe s4" />
+        <i className="trk-stripe s5" />
+      </div>
+
+      <div className="trk-strip" />
+      <header className="trk-header">
+        <div className="trk-brand">
+          <img src="/image.png" alt="PS QuickIT" className="trk-logo-img" />
+          <div className="trk-brand-sub">Support Desk</div>
+        </div>
+        <div className="trk-header-title">Ticket Status</div>
+      </header>
+
+      <section className="trk-hero">
+        <div className="trk-hero-text">
+          <div className="trk-hero-welcome">Track Your Request</div>
+          <div className="trk-hero-sub">PS QuickIt Support Portal</div>
+        </div>
+      </section>
+
+      <main className="trk-main">{children}</main>
+
+      <footer className="trk-footer">© PS QuickIt Support · This is an automated status page</footer>
+    </div>
+  );
+}
+
+/** Download links for files on the ticket or on a comment (public, no login). */
+function Files({ ticketId, items }: { ticketId: string; items?: PubAttachment[] }) {
+  if (!items || items.length === 0) return null;
+  return (
+    <div className="trk-files">
+      {items.map((a) => (
+        <a
+          key={a.id}
+          href={`${API_BASE}/api/public/tickets/${ticketId}/attachments/${a.id}`}
+          className="trk-file"
+          download
+        >
+          📎 <span>{a.filename}</span> <em>{formatSize(a.sizeBytes)}</em>
+        </a>
+      ))}
+    </div>
+  );
+}
 
 export default function TicketTrack() {
   const { id } = useParams<{ id: string }>();
@@ -68,15 +125,16 @@ export default function TicketTrack() {
     };
   }, [id]);
 
-  if (loading) return <div className="trk-page"><div className="trk-card trk-center">Loading your ticket…</div></div>;
+  if (loading) return <Shell><div className="trk-card trk-center">Loading your ticket…</div></Shell>;
+
   if (notFound || !t)
     return (
-      <div className="trk-page">
+      <Shell>
         <div className="trk-card trk-center">
           <h2>Ticket not found</h2>
           <p className="trk-muted">Please check the link in your email, or reply to that email and we’ll help.</p>
         </div>
-      </div>
+      </Shell>
     );
 
   const key = t.ticketNumber ? `PS-${t.ticketNumber}` : 'Your ticket';
@@ -84,19 +142,11 @@ export default function TicketTrack() {
   const timeline = [...t.history].reverse();
 
   return (
-    <div className="trk-page">
+    <Shell>
       <div className="trk-card">
-        <div className="trk-brand">
-          <div className="trk-logo">PS</div>
-          <div>
-            <div className="trk-brand-name">PS QuickIt</div>
-            <div className="trk-muted">Support ticket status</div>
-          </div>
-        </div>
-
         <div className="trk-head">
           <div>
-            <div className="trk-label">Ticket</div>
+            <div className="trk-label">Ticket number</div>
             <div className="trk-key">{key}</div>
           </div>
           <span className={`trk-badge trk-${t.status.toLowerCase()}`}>{STEP_LABEL[t.status] || t.status}</span>
@@ -107,7 +157,7 @@ export default function TicketTrack() {
         <div className="trk-steps">
           {STEPS.map((s, i) => (
             <div key={s} className={`trk-step${i <= idx ? ' done' : ''}${i === idx ? ' current' : ''}`}>
-              <div className="trk-dot">{i < idx || (i === idx && t.status === 'CLOSED') ? <CheckIcon size={12} /> : i + 1}</div>
+              <div className="trk-dot">{i < idx || (i === idx && t.status === 'CLOSED') ? <CheckIcon size={13} /> : i + 1}</div>
               <div className="trk-step-label">{STEP_LABEL[s]}</div>
             </div>
           ))}
@@ -126,8 +176,9 @@ export default function TicketTrack() {
         </div>
 
         <div className="trk-section">
-          <div className="trk-label">Your request</div>
+          <h3>Your request</h3>
           <p className="trk-text">{t.description}</p>
+          <Files ticketId={t.id} items={t.attachments} />
         </div>
 
         <div className="trk-section">
@@ -143,6 +194,7 @@ export default function TicketTrack() {
                     <span className="trk-muted">{fmt(c.timestamp)}</span>
                   </div>
                   <div className="trk-text">{c.text}</div>
+                  <Files ticketId={t.id} items={c.attachments} />
                 </div>
               ))}
             </div>
@@ -166,6 +218,6 @@ export default function TicketTrack() {
           Need to add something? Simply reply to the email we sent you and it will be added to this ticket.
         </div>
       </div>
-    </div>
+    </Shell>
   );
 }

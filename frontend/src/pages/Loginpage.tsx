@@ -38,13 +38,12 @@ export default function Loginpage() {
   return (
     <div className="login-wrap">
       <form onSubmit={submit} className="login-card">
-        <div className="brand" style={{ padding: 0, marginBottom: 20 }}>
-          <div className="brand-logo">PS</div>
-          <div>
-            <div className="brand-name">PS QuickIt</div>
-            <div className="brand-sub">Support desk</div>
-          </div>
-        </div>
+       <div className="brand" style={{ padding: 0, marginBottom: 20 }}>
+  <div className="brand-container">
+    <img src="/image.png" alt="PS QuickIT" className="brand-image" style={{ maxWidth: '100%', height: 'auto' }} />
+    <div className="brand-sub">Support desk</div>
+  </div>
+</div>
 
         <h2>Log in to your account</h2>
         <div className="hint">Use the email and password you were given.</div>
